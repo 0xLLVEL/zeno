@@ -2427,12 +2427,24 @@ fn remote_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, Strin
         .collect();
     ordered.sort_by_key(|entry| entry.0);
 
-    let candidates: Vec<u32> = ordered
-        .iter()
-        .filter(|(rank, _)| *rank <= 2)
-        .map(|(_, id)| *id)
-        .collect();
-    println!("run         {} candidate threads", candidates.len());
+    // A thread blocked in a kernel wait keeps its user RIP frozen and ignores
+    // the context we install until it wakes, so take samples twice and put the
+    // ones that are actually consuming cycles first.
+    let mut candidates: Vec<(bool, u32)> = Vec::new();
+    for (rank, id) in ordered.iter().filter(|(rank, _)| *rank <= 2) {
+        let _ = rank;
+        let first = thread_rip(handle, *id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = thread_rip(handle, *id);
+        let hot = matches!((first, second), (Some(a), Some(b)) if a != b);
+        candidates.push((hot, *id));
+    }
+    candidates.sort_by_key(|(hot, _)| !*hot);
+    let candidates: Vec<u32> = candidates.into_iter().map(|(_, id)| id).take(4).collect();
+    println!(
+        "run         {} candidate threads (hot first)",
+        candidates.len()
+    );
 
     let mut last_error = String::from("no thread available");
     let mut done = false;
