@@ -163,6 +163,12 @@ extern "system" {
         flags: u32,
         template: Handle,
     ) -> Handle;
+    fn VirtualQueryEx(
+        process: Handle,
+        address: *const c_void,
+        buffer: *mut c_void,
+        length: usize,
+    ) -> usize;
 }
 
 struct Module {
@@ -209,7 +215,8 @@ fn modules_of(pid: u32) -> Vec<Module> {
         }
         let entry = link.wrapping_sub(0x10);
         let base = read_u64(handle, entry + 0x30);
-        let size = read_u64(handle, entry + 0x38) & 0xFFFF_FFFF;
+        // SizeOfImage is a ULONG at +0x40; +0x38 is EntryPoint.
+        let size = read_u64(handle, entry + 0x40) & 0xFFFF_FFFF;
         let name_len = read_u64(handle, entry + 0x58) & 0xFFFF;
         let name_ptr = read_u64(handle, entry + 0x60);
         let mut name = String::new();
@@ -669,6 +676,20 @@ fn context_test(pid: u32) -> Result<(), String> {
         }
     }
 
+    println!("ctxtest     contexts restored, watching");
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "ctxtest     t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+
     unsafe { CloseHandle(handle) };
     Ok(())
 }
@@ -989,7 +1010,7 @@ struct ImageOpts {
 /// mapping-only run proves the mapped view is not what dies at t+30s — it dies
 /// without a byte of it ever running. This isolates which syscall the client
 /// objects to.
-fn touch_test(pid: u32, alloc: bool, write: bool) -> Result<(), String> {
+fn touch_test(pid: u32, alloc: bool, write: bool, execute: bool) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
@@ -1026,6 +1047,12 @@ fn touch_test(pid: u32, alloc: bool, write: bool) -> Result<(), String> {
             let peb = read_u64_checked(handle, 0x7FFF_FFFF_FFFF).unwrap_or(0);
             notes.push_str(&format!(" read-probe {peb:X}"));
         }
+    }
+
+    if execute && alloc {
+        let mut old = 0u32;
+        let ok = unsafe { VirtualProtectEx(handle, block, 0x1000, 0x40, &mut old) };
+        notes.push_str(&format!(" protect-rwx {ok} (was 0x{old:X})"));
     }
 
     println!("touch       {notes}");
@@ -1150,6 +1177,7 @@ fn hollow_test(
     pid: u32,
     payload: &std::path::Path,
     carrier: Option<&str>,
+    use_existing: bool,
 ) -> Result<(), String> {
     let file = std::fs::read(payload).map_err(|e| format!("{}: {e}", payload.display()))?;
     let image_size = map::image_size(&file)?;
@@ -1186,12 +1214,11 @@ fn hollow_test(
     let candidates: Vec<String> = match carrier {
         Some(name) => vec![name.to_string()],
         None => [
-            r"C:\Windows\System32\WindowsCodecs.dll",
-            r"C:\Windows\System32\msmpeg2vdec.dll",
             r"C:\Windows\System32\NaturalLanguage6.dll",
-            r"C:\Windows\System32\mscms.dll",
+            r"C:\Windows\System32\msmpeg2vdec.dll",
             r"C:\Windows\System32\wmvdspa.dll",
-            r"C:\Windows\System32\mswsock.dll",
+            r"C:\Windows\System32\mfc42.dll",
+            r"C:\Windows\System32\mscms.dll",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1202,7 +1229,14 @@ fn hollow_test(
     for candidate in candidates {
         let short = candidate.rsplit('\\').next().unwrap_or(&candidate).to_string();
         let before = modules_of(pid);
-        if !before.iter().any(|module| module.name.eq_ignore_ascii_case(&short)) {
+        let present = before.iter().find(|module| module.name.eq_ignore_ascii_case(&short));
+        if present.is_some() && !use_existing {
+            // Already in the process: something else owns it and hollowing it
+            // out would break a live consumer.
+            println!("hollow      {short} already loaded, skipping");
+            continue;
+        }
+        if present.is_none() {
             let text = wide(&candidate);
             let buffer = unsafe {
                 VirtualAllocEx(
@@ -1229,9 +1263,9 @@ fn hollow_test(
             else {
                 continue;
             };
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::thread::sleep(std::time::Duration::from_millis(3000));
             unpark(handle, &parked);
-            println!("hollow      loaded {short}");
+            println!("hollow      asked for {short}");
         }
 
         let after = modules_of(pid);
@@ -1300,6 +1334,480 @@ fn hollow_test(
 
     unsafe { CloseHandle(handle) };
     Ok(())
+}
+
+/// Loads one signed DLL through `LoadLibraryW` and then only watches.
+///
+/// Every test so far that ended the client also added something to the module
+/// list. This is the one variable left: does a module the loader *did* create
+/// survive the client's own scan?
+fn load_watch(pid: u32, library: &str) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let stack = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x8000, MEM_COMMIT_RESERVE, 0x04)
+    };
+    if stack.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("stack allocation failed".into());
+    }
+    let stack_top = stack as u64 + 0x8000 - 0x10;
+    let kernel32 = unsafe { GetModuleHandleW(wide("kernel32.dll").as_ptr()) };
+    let park = unsafe { GetProcAddress(kernel32, b"SleepEx\0".as_ptr()) } as u64;
+    let load_library = unsafe { GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr()) } as u64;
+
+    let text = wide(library);
+    let mut written = 0usize;
+    let buffer = unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            text.len() * 2 + 0x10,
+            MEM_COMMIT_RESERVE,
+            0x04,
+        )
+    };
+    if buffer.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("path allocation failed".into());
+    }
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            buffer,
+            text.as_ptr() as *const c_void,
+            text.len() * 2,
+            &mut written,
+        );
+        WriteProcessMemory(
+            handle,
+            (stack_top - 8) as *mut c_void,
+            &park as *const u64 as *const c_void,
+            8,
+            &mut written,
+        );
+    }
+
+    let short = library.rsplit('\\').next().unwrap_or(library);
+    let Some(parked) = hijack(handle, pid, &modules, load_library, buffer as u64, stack_top - 8, park)
+    else {
+        unsafe { CloseHandle(handle) };
+        return Err("no thread available".into());
+    };
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    unpark(handle, &parked);
+
+    let after = modules_of(pid);
+    let hit = after.iter().find(|m| m.name.eq_ignore_ascii_case(short));
+    println!(
+        "loadwatch   modules {} -> {}, {}",
+        modules.len(),
+        after.len(),
+        match hit {
+            Some(m) => format!("{short} base 0x{:X} size 0x{:X}", m.base, m.size),
+            None => format!("{short} absent"),
+        }
+    );
+
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "loadwatch   t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Writes a five-byte `mov eax, 0x5EED0001; ret` into a private RWX page and
+/// jumps a thread at it.
+///
+/// The earlier manual-map attempts died instantly and were read as "the client
+/// kills private executable pages". A private RWX page by itself survives a
+/// full minute, so instant death was most likely our own fault — bad imports,
+/// missing TLS, a stub returning into junk. This isolates it: five bytes of
+/// known-good code, one call, one restore.
+fn exec_ping(pid: u32) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let code = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x2000, MEM_COMMIT_RESERVE, 0x04)
+    };
+    if code.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("code allocation failed".into());
+    }
+    let mut written = 0usize;
+    let bytes: [u8; 6] = [0xB8, 0x01, 0x00, 0xED, 0x5E, 0xC3];
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            code,
+            bytes.as_ptr() as *const c_void,
+            6,
+            &mut written,
+        )
+    };
+    let mut old = 0u32;
+    unsafe { VirtualProtectEx(handle, code, 0x1000, 0x40, &mut old) };
+
+    let stack_top = code as u64 + 0x2000 - 0x10;
+    let kernel32 = unsafe { GetModuleHandleW(wide("kernel32.dll").as_ptr()) };
+    let park = unsafe { GetProcAddress(kernel32, b"SleepEx\0".as_ptr()) } as u64;
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            (stack_top - 8) as *mut c_void,
+            &park as *const u64 as *const c_void,
+            8,
+            &mut written,
+        )
+    };
+
+    let modules = modules_of(pid);
+    let Some(parked) = hijack(handle, pid, &modules, code as u64, 0, stack_top - 8, park) else {
+        unsafe { CloseHandle(handle) };
+        return Err("no thread available".into());
+    };
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    unpark(handle, &parked);
+    println!("execping    called 0x{:X}, thread restored", code as u64);
+
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "execping    t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Touches one 13-byte window inside the client's own `.text`.
+///
+/// `identical` rewrites the exact bytes that were read, so a content hash is
+/// unchanged and only the page's private/shared state differs. Otherwise it
+/// writes `0x90`, then puts the original bytes back immediately — the shape a
+/// real detour would have if it were armed and disarmed inside one burst.
+fn patch_test(pid: u32, rva: u32, identical: bool) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let client = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
+        .ok_or("client module not found")?;
+    let address = client.base + rva as u64;
+
+    let mut original = [0u8; 13];
+    let mut got = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            handle,
+            address as *const c_void,
+            original.as_mut_ptr() as *mut c_void,
+            13,
+            &mut got,
+        )
+    };
+    if ok == 0 || got != 13 {
+        unsafe { CloseHandle(handle) };
+        return Err("cannot read target bytes".into());
+    }
+    println!("patchtest   {EXE}+0x{rva:X} = {:02X?}", original);
+
+    let page = address & !0xFFF;
+    let mut old = 0u32;
+    // Image pages here refuse PAGE_EXECUTE_READWRITE (87), so walk down the
+    // legal set. PAGE_EXECUTE_WRITECOPY is the one that belongs to images: the
+    // write goes to a private copy and the shared view stays clean.
+    let mut protected = 0;
+    for want in [0x40u32, 0x80, 0x04] {
+        protected = unsafe { VirtualProtectEx(handle, page as *mut c_void, 0x1000, want, &mut old) };
+        if protected != 0 {
+            println!("patchtest   protection 0x{want:X} ok (was 0x{old:X})");
+            break;
+        }
+    }
+    if protected == 0 {
+        unsafe { CloseHandle(handle) };
+        return Err(format!("VirtualProtectEx failed ({})", unsafe { GetLastError() }));
+    }
+
+    let mut written = 0usize;
+    let replacement: [u8; 13] = if identical { original } else { [0x90; 13] };
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            address as *mut c_void,
+            replacement.as_ptr() as *const c_void,
+            13,
+            &mut written,
+        )
+    };
+    if !identical {
+        unsafe {
+            WriteProcessMemory(
+                handle,
+                address as *mut c_void,
+                original.as_ptr() as *const c_void,
+                13,
+                &mut written,
+            )
+        };
+    }
+    unsafe { VirtualProtectEx(handle, page as *mut c_void, 0x1000, old, &mut old) };
+    println!(
+        "patchtest   {}{}, protection back to 0x{old:X}",
+        if identical { "rewrote identical bytes" } else { "flipped to nops and restored" },
+        ""
+    );
+
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "patchtest   t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Reports the things a scanner could object to in a target process: image
+/// regions that no loader entry owns, and private regions that are executable.
+///
+/// Not an emulator of Hyperion — an emulator would need its predicate, and the
+/// predicate is compiled into a 100 MB `.text` with no symbol we can name. This
+/// encodes the three rules the client has already enforced on us, so a new
+/// injection shape can be checked in a second instead of costing a rejoin.
+fn oracle(pid: u32) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let inside_module = |address: u64| {
+        modules
+            .iter()
+            .any(|module| address >= module.base && address < module.base + module.size)
+    };
+
+    let mut address = 0x10000u64;
+    let mut unregistered = Vec::new();
+    let mut private_exec = Vec::new();
+    let mut image_regions = 0usize;
+    let mut private_regions = 0usize;
+    let mut info = [0u8; 48];
+
+    while address < 0x7FFF_FFFF_0000 {
+        let got = unsafe {
+            VirtualQueryEx(
+                handle,
+                address as *const c_void,
+                info.as_mut_ptr() as *mut c_void,
+                48,
+            )
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        let kind = u32::from_le_bytes(info[0x28..0x2C].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+
+        if state == 0x1000 {
+            match kind {
+                0x100_0000 => {
+                    image_regions += 1;
+                    // An image region is "unowned" only when it sits outside
+                    // every module's span; a module is split into one region per
+                    // protection, so comparing bases directly flags everything.
+                    if !inside_module(base) {
+                        unregistered.push((base, size, protect));
+                    }
+                }
+                0x2_0000 => {
+                    private_regions += 1;
+                    let executable = matches!(
+                        protect & 0xFF,
+                        0x10 | 0x20 | 0x40 | 0x80
+                    );
+                    // Windows itself keeps private executable pages inside
+                    // modules (CFG bitmaps, hot patches). Only pages with no
+                    // module to belong to are worth reporting.
+                    if executable && !inside_module(base) {
+                        private_exec.push((base, size, protect));
+                    }
+                }
+                _ => {}
+            }
+        }
+        address = base + size;
+        if address <= base {
+            break;
+        }
+    }
+
+    println!(
+        "oracle      modules {}, image regions {image_regions}, private regions {private_regions}",
+        modules.len()
+    );
+    println!("oracle      unregistered image views: {}", unregistered.len());
+    for (base, size, protect) in &unregistered {
+        println!("oracle        image 0x{base:X} +0x{size:X} prot 0x{protect:X}");
+    }
+    println!("oracle      executable private regions: {}", private_exec.len());
+    for (base, size, protect) in &private_exec {
+        if *size >= 0x1000 {
+            println!("oracle        private 0x{base:X} +0x{size:X} prot 0x{protect:X}");
+        }
+    }
+
+    let verdict = unregistered.is_empty() && private_exec.is_empty();
+    println!(
+        "oracle      verdict: {}",
+        if verdict { "clean" } else { "would trip" }
+    );
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Captures `lua_State*` without writing a single byte into the client.
+///
+/// Patching `luaD_call` is closed: even rewriting its original bytes kills the
+/// client, so the check watches whether a code page stopped being the shared
+/// file view. Sampling is passive by comparison — suspend a thread, read RIP and
+/// RCX, resume. When RIP lands inside a function of interest, RCX is its first
+/// argument, which for `luaD_call` is the thread state.
+fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let client = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
+        .ok_or("client module not found")?;
+    let entry = client.base + rva as u64;
+    println!(
+        "sampler     watching RobloxPlayerBeta+0x{rva:X} (0x{entry:X} .. 0x{:X})",
+        entry + span
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut samples = 0u64;
+    let mut hits = 0u64;
+    while std::time::Instant::now() < deadline && hits == 0 {
+        for id in threads_of(pid) {
+            let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+            if thread.is_null() {
+                continue;
+            }
+            unsafe { SuspendThread(thread) };
+            let mut context = vec![0u8; CONTEXT_SIZE];
+            unsafe {
+                *(context.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+            }
+            if unsafe { GetThreadContext(thread, context.as_mut_ptr() as *mut c_void) } != 0 {
+                samples += 1;
+                let rip = unsafe { *(context.as_ptr().add(0xF8) as *const u64) };
+                if rip >= entry && rip < entry + span {
+                    hits += 1;
+                    let rcx = unsafe { *(context.as_ptr().add(0x78) as *const u64) };
+                    let rdx = unsafe { *(context.as_ptr().add(0x80) as *const u64) };
+                    let r8 = unsafe { *(context.as_ptr().add(0x88) as *const u64) };
+                    println!(
+                        "sampler     hit thread {id} rip 0x{rip:X} (+0x{:X}) rcx 0x{rcx:X} rdx 0x{rdx:X} r8 0x{r8:X}",
+                        rip - entry
+                    );
+                    describe_state(handle, rcx);
+                }
+            }
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            }
+            if hits > 0 {
+                break;
+            }
+        }
+        if samples % 5000 < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    println!("sampler     {samples} thread samples, {hits} hits");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Prints the fields of a candidate `lua_State` so a false hit is obvious.
+fn describe_state(handle: Handle, state: u64) {
+    if state < 0x10000 || state % 8 != 0 {
+        println!("sampler     rcx 0x{state:X} does not look like a pointer");
+        return;
+    }
+    let fields = [
+        ("stack_base", 0x28u64),
+        ("stack", 0x48),
+        ("global", 0x50),
+        ("base", 0x58),
+        ("top", 0x60),
+        ("ci", 0x70),
+        ("stack_last", 0x78),
+    ];
+    for (name, offset) in fields {
+        match read_u64_checked(handle, state + offset) {
+            Some(value) => println!("sampler       {name:<11} +0x{offset:02X} = 0x{value:X}"),
+            None => {
+                println!("sampler       {name:<11} +0x{offset:02X} unreadable, not a state");
+                return;
+            }
+        }
+    }
+    let status = unsafe {
+        let mut byte = 0u8;
+        let mut got = 0usize;
+        ReadProcessMemory(
+            handle,
+            (state + 0xA) as *const c_void,
+            &mut byte as *mut u8 as *mut c_void,
+            1,
+            &mut got,
+        );
+        byte
+    };
+    println!("sampler       status      +0x0A = {status}");
 }
 
 fn image_test(
@@ -1643,7 +2151,14 @@ fn main() -> Result<(), String> {
     let mut unmap = false;
     let mut touch = 0u8; // 0 off, 1 open, 2 open+alloc, 3 open+alloc+write
     let mut hollow = false;
+    let mut list_modules: Option<u32> = None;
+    let mut load_watch_lib: Option<String> = None;
+    let mut exec_ping_pid: Option<u32> = None;
+    let mut patch: Option<(u32, bool)> = None;
+    let mut oracle_pid: Option<u32> = None;
+    let mut sampler: Option<(u32, u32, u64)> = None;
     let mut carrier: Option<String> = None;
+    let mut use_existing = false;
     let mut mode: u64 = 1;
     let mut load: Option<PathBuf> = None;
     let mut config = PathBuf::from(
@@ -1676,10 +2191,62 @@ fn main() -> Result<(), String> {
             "--touch" => touch = 1,
             "--touchalloc" => touch = 2,
             "--touchwrite" => touch = 3,
+            "--touchprot" => touch = 4,
+            "--touchrwx" => touch = 5,
             "--hollow" => hollow = true,
+            "--loadwatch" => {
+                load_watch_lib = Some(argv.next().ok_or("--loadwatch needs a dll path")?);
+            }
+            "--execping" => {
+                exec_ping_pid = Some(match pid {
+                    Some(value) => value,
+                    None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
+                });
+            }
+            "--sample" => {
+                let value = argv.next().ok_or("--sample needs an rva")?;
+                let rva = u32::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad rva {value}"))?;
+                let span = match argv.next() {
+                    Some(text) => u64::from_str_radix(text.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad span {text}"))?,
+                    None => 0x200,
+                };
+                sampler = Some((
+                    match pid {
+                        Some(value) => value,
+                        None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
+                    },
+                    rva,
+                    span,
+                ));
+            }
+            "--oracle" => {                oracle_pid = Some(match pid {
+                    Some(value) => value,
+                    None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
+                });
+            }
+            "--patchtest" => {                let value = argv.next().ok_or("--patchtest needs an rva")?;
+                let rva = u32::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad rva {value}"))?;
+                patch = Some((rva, true));
+            }
+            "--patchflip" => {
+                let value = argv.next().ok_or("--patchflip needs an rva")?;
+                let rva = u32::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad rva {value}"))?;
+                patch = Some((rva, false));
+            }
+            "--modules" => {
+                list_modules = Some(match pid {
+                    Some(value) => value,
+                    None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
+                });
+            }
             "--carrier" => {
                 carrier = Some(argv.next().ok_or("--carrier needs a path")?);
             }
+            "--carrier-existing" => use_existing = true,
             "--load" => load = Some(PathBuf::from(argv.next().ok_or("--load needs a path")?)),
             "--mode" => {
                 let value = argv.next().ok_or("--mode needs a number")?;
@@ -1704,15 +2271,47 @@ fn main() -> Result<(), String> {
         None => None,
     };
 
+    if let Some((target, rva, span)) = sampler {
+        return sample_state(target, rva, span, 30);
+    }
+
+    if let Some(target) = oracle_pid {
+        return oracle(target);
+    }
+
+    if let Some((rva, identical)) = patch {
+        let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return patch_test(pid, rva, identical);
+    }
+
+    if let Some(target) = exec_ping_pid {
+        return exec_ping(target);
+    }
+
+    if let Some(library) = load_watch_lib {
+        let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return load_watch(pid, &library);
+    }
+
+    if let Some(list) = list_modules {
+        let mut modules = modules_of(list);
+        modules.sort_by_key(|module| module.base);
+        for module in &modules {
+            println!("0x{:012X} 0x{:08X}  {}", module.base, module.size, module.name);
+        }
+        println!("{} modules", modules.len());
+        return Ok(());
+    }
+
     if hollow {
         let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         let dll = dll.as_ref().ok_or("--hollow needs --dll <payload.dll>")?;
-        return hollow_test(pid, dll, carrier.as_deref());
+        return hollow_test(pid, dll, carrier.as_deref(), use_existing);
     }
 
     if touch != 0 {
         let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
-        return touch_test(pid, touch >= 2, touch >= 3);
+        return touch_test(pid, touch >= 2, touch == 3 || touch == 5, touch >= 4);
     }
 
     if imagetest || imageload || imagehold {
