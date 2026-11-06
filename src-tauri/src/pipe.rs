@@ -7,9 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    ReadFile, WriteFile, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
+    ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
-use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_BYTE};
+use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE};
 
 pub const IN_PIPE: &str = r"\\.\pipe\zeno_in";
 pub const OUT_PIPE: &str = r"\\.\pipe\zeno_out";
@@ -62,7 +62,14 @@ pub fn drain() -> Vec<String> {
 
 fn create_pipe(name: &str, outbound: bool) -> Option<SendHandle> {
     let wide = crate::injector::wide(name);
-    let mode = if outbound { PIPE_ACCESS_OUTBOUND } else { PIPE_ACCESS_INBOUND };
+    let mode = if outbound {
+        PIPE_ACCESS_OUTBOUND
+    } else {
+        PIPE_ACCESS_INBOUND
+    };
+    // A local pipe is the whole threat surface here: only this machine may
+    // connect, and only one instance exists at a time.
+    let mode = mode | FILE_FLAGS_AND_ATTRIBUTES(PIPE_REJECT_REMOTE_CLIENTS.0);
     let handle = unsafe {
         CreateNamedPipeW(
             PCWSTR(wide.as_ptr()),
