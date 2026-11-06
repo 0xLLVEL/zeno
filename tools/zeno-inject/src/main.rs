@@ -16,6 +16,7 @@ const PAGE_READWRITE: u32 = 0x04;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const EXE: &str = "RobloxPlayerBeta.exe";
 const SENTINEL: u64 = 0x5EED_0000_0000_0001;
+const ENTERED: u64 = 0x5EED_0000_0000_0002;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -178,13 +179,15 @@ fn run_stub(handle: Handle, threads: &[u32], stub: u64, marker: u64) -> Option<(
             CloseHandle(thread);
         }
 
-        if value != 0 && value != SENTINEL {
+        if value != 0 && value != SENTINEL && value != ENTERED {
             return Some((*id, value));
         }
         if value == SENTINEL {
-            println!("hijack      thread {id} started the stub but never returned");
+            println!("hijack      thread {id} never reached the stub");
+        } else if value == ENTERED {
+            println!("hijack      thread {id} entered the payload and never came back");
         } else {
-            println!("hijack      thread {id} did not run the stub");
+            println!("hijack      thread {id} ran the stub, result 0");
         }
     }
     None
@@ -458,6 +461,13 @@ fn main() -> Result<(), String> {
         // point, and Windows x64 needs rsp 16-aligned before a call.
         code.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]);
         code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+        // Publish "the stub is running" before the call, so a hang inside the
+        // payload is distinguishable from "the thread never ran at all".
+        code.extend_from_slice(&[0x48, 0xBA]);
+        code.extend_from_slice(&mixed.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&ENTERED.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0x02]);
         code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&entry.to_le_bytes());
         code.extend_from_slice(&[0x48, 0xB9]);
@@ -489,6 +499,27 @@ fn main() -> Result<(), String> {
                 &mut written,
             )
         };
+        {
+            let mut check = [0u8; 16];
+            let mut got = 0usize;
+            let ok = unsafe {
+                ReadProcessMemory(
+                    handle,
+                    stub_block as *const c_void,
+                    check.as_mut_ptr() as *mut c_void,
+                    check.len(),
+                    &mut got,
+                )
+            };
+            let hex: Vec<String> = check.iter().map(|b| format!("{b:02X}")).collect();
+            println!(
+                "stub        0x{:X}, {} bytes written, readback ok={} [{}]",
+                stub_block as u64,
+                code.len(),
+                ok != 0 && got == check.len(),
+                hex.join(" ")
+            );
+        }
 
         let list = threads_of(pid);
         println!("target      pid {pid}, {} threads", list.len());
