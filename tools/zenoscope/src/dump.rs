@@ -11,6 +11,7 @@
 //! on-disk image, which gives a PE whose section table is still intact and
 //! whose code is real.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
@@ -1026,6 +1027,244 @@ fn fill_block(handle: Handle, base: u64, section: &Section, block: &mut [u8]) ->
         rva += page;
     }
     read
+}
+
+// ------------------------------------------------------------ chain walk
+
+pub struct Hop {
+    pub label: String,
+    pub address: u64,
+    pub value: u64,
+    pub name: String,
+    pub class: String,
+}
+
+fn read_u64_live(handle: Handle, address: u64) -> Option<u64> {
+    if address < 0x10000 {
+        return None;
+    }
+    let bytes = read_page(handle, address, 8).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+/// MSVC `std::string`: 16 inline bytes, length at +0x10, heap pointer when long.
+fn read_string_live(handle: Handle, address: u64) -> String {
+    if address < 0x10000 {
+        return String::new();
+    }
+    let Some(head) = read_page(handle, address, 0x20).ok() else {
+        return String::new();
+    };
+    if head.len() < 0x18 {
+        return String::new();
+    }
+
+    let length = i32::from_le_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
+    if length <= 0 || length > 4096 {
+        return String::new();
+    }
+
+    let data = if length >= 16 {
+        let pointer = u64::from_le_bytes([
+            head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+        ]);
+        match read_page(handle, pointer, length as usize) {
+            Ok(bytes) => bytes,
+            Err(_) => return String::new(),
+        }
+    } else {
+        head[..length as usize].to_vec()
+    };
+
+    let end = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
+}
+
+fn describe(handle: Handle, instance: u64, offsets: &HashMap<String, u64>) -> (String, String) {
+    let name_offset = offsets.get("Instance::NameContainer").copied().unwrap_or(0);
+    let class_offset = offsets.get("Instance::ClassDescriptor").copied().unwrap_or(0);
+    let class_name_offset = offsets.get("Instance::ClassName").copied().unwrap_or(0);
+
+    let name = if name_offset != 0 {
+        read_u64_live(handle, instance + name_offset)
+            .map(|base| {
+                read_string_live(
+                    handle,
+                    base + offsets.get("Instance::Name").copied().unwrap_or(0),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let class = if class_offset != 0 {
+        read_u64_live(handle, instance + class_offset)
+            .and_then(|descriptor| read_u64_live(handle, descriptor + class_name_offset))
+            .map(|text| read_string_live(handle, text))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    (name, class)
+}
+
+/// Follow the pack's globals through the live client: VisualEngine ->
+/// FakeDataModel -> DataModel -> Workspace / ScriptContext, with each object's
+/// name and class read straight out of the engine's own layout.
+pub fn chain(
+    pid: Option<u32>,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+) -> Result<Vec<Hop>, String> {
+    match enable_debug_privilege() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err("SeDebugPrivilege was not granted — run from an elevated shell".into())
+        }
+        Err(because) => return Err(format!("privilege: {because}")),
+    }
+
+    let pid = match pid {
+        Some(pid) => pid,
+        None => live::find_pid(crate::CLIENT_EXE)
+            .ok_or_else(|| format!("{} is not running; pass --pid <n>", crate::CLIENT_EXE))?,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "OpenProcess({pid}) with PROCESS_ALL_ACCESS failed ({}); elevation is required",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let result = chain_with(handle, pid, module, offsets);
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+fn chain_with(
+    handle: Handle,
+    pid: u32,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+) -> Result<Vec<Hop>, String> {
+    let (base, _size, _path) = live::module_info(pid, module)
+        .ok_or_else(|| format!("module {module} is not loaded in pid {pid}"))?;
+
+    let mut hops = Vec::new();
+    let mut push = |label: &str, address: u64, value: u64| {
+        let (name, class) = describe(handle, address, offsets);
+        hops.push(Hop {
+            label: label.to_string(),
+            address,
+            value,
+            name,
+            class,
+        });
+    };
+
+    let slot = |key: &str| offsets.get(key).copied().unwrap_or(0) as u64;
+
+    let visual_slot = base + slot("VisualEngine::Pointer");
+    let visual = read_u64_live(handle, visual_slot).unwrap_or(0);
+    push("VisualEngine::Pointer", visual_slot, visual);
+
+    let fake_offset = offsets.get("VisualEngine::FakeDataModel").copied().unwrap_or(0) as u64;
+    let fake = read_u64_live(handle, visual + fake_offset).unwrap_or(0);
+    push("VisualEngine -> FakeDataModel", visual + fake_offset, fake);
+
+    let real_offset = offsets.get("FakeDataModel::RealDataModel").copied().unwrap_or(0) as u64;
+    let datamodel = read_u64_live(handle, fake + real_offset).unwrap_or(0);
+    push("FakeDataModel -> RealDataModel", fake + real_offset, datamodel);
+
+    let fake_slot = base + slot("FakeDataModel::Pointer");
+    let datamodel_direct = read_u64_live(handle, fake_slot).unwrap_or(0);
+    push("FakeDataModel::Pointer", fake_slot, datamodel_direct);
+
+    if datamodel != 0 {
+        for (name, key, label) in [
+            ("Workspace", "DataModel::Workspace", "DataModel -> Workspace"),
+            ("ScriptContext", "DataModel::ScriptContext", "DataModel -> ScriptContext"),
+        ] {
+            let delta = offsets.get(key).copied().unwrap_or(0) as u64;
+            let child = read_u64_live(handle, datamodel + delta).unwrap_or(0);
+            push(label, datamodel + delta, child);
+            let _ = name;
+        }
+    }
+
+    Ok(hops)
+}
+
+/// Names and classes of an instance's direct children, in order.
+pub fn children_of(
+    pid: Option<u32>,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+    instance: u64,
+    limit: usize,
+) -> Result<Vec<(String, String, u64)>, String> {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => live::find_pid(crate::CLIENT_EXE)
+            .ok_or_else(|| format!("{} is not running; pass --pid <n>", crate::CLIENT_EXE))?,
+    };
+    let _ = module;
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "OpenProcess({pid}) with PROCESS_ALL_ACCESS failed ({}); elevation is required",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let listing = children(handle, instance, offsets, limit);
+    unsafe { CloseHandle(handle) };
+    Ok(listing)
+}
+
+/// Names and classes of the data model's direct children, in order.
+pub fn children(
+    handle: Handle,
+    instance: u64,
+    offsets: &HashMap<String, u64>,
+    limit: usize,
+) -> Vec<(String, String, u64)> {
+    let children_offset = offsets.get("Instance::ChildrenStart").copied().unwrap_or(0) as u64;
+    if instance == 0 || children_offset == 0 {
+        return Vec::new();
+    }
+
+    let holder = read_u64_live(handle, instance + children_offset).unwrap_or(0);
+    let begin = read_u64_live(handle, holder).unwrap_or(0);
+    let end = read_u64_live(handle, holder + 8).unwrap_or(0);
+    if begin == 0 || end <= begin {
+        return Vec::new();
+    }
+
+    // `Children` is a vector of `shared_ptr<Instance>`: 8-byte pointer plus an
+    // 8-byte control block, so entries sit 0x10 apart.
+    const STRIDE: u64 = 0x10;
+    let count = ((end - begin) / STRIDE).min(limit as u64);
+    let mut out = Vec::new();
+    for index in 0..count {
+        let child = read_u64_live(handle, begin + index * STRIDE).unwrap_or(0);
+        if child < 0x10000 {
+            continue;
+        }
+        let (name, class) = describe(handle, child, offsets);
+        out.push((name, class, child));
+    }
+    out
 }
 
 /// Flush, read and rejoin every page of a loaded module.

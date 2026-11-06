@@ -12,6 +12,7 @@ mod image;
 mod live;
 mod scan;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -39,6 +40,7 @@ struct Args {
     inspect: Option<usize>,
     watch: Option<u64>,
     base: Option<PathBuf>,
+    chain: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, String> {
         inspect: None,
         watch: None,
         base: None,
+        chain: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -98,6 +101,9 @@ fn parse_args() -> Result<Args, String> {
             "--base" => {
                 args.base = Some(PathBuf::from(argv.next().ok_or("--base needs a path")?));
             }
+            "--chain" => {
+                args.chain = Some(PathBuf::from(argv.next().ok_or("--chain needs a pack")?));
+            }
             "--inspect" => {
                 let value = argv.next().ok_or("--inspect needs a page count")?;
                 args.inspect = Some(
@@ -120,6 +126,8 @@ fn parse_args() -> Result<Args, String> {
                 println!("                            handler decrypts .text; visible to the anti-tamper");
                 println!("zenoscope --watch <secs>    sample .text and keep every decrypted page");
                 println!("           [--base <image>] [--out <path>]");
+                println!("zenoscope --chain <hpp>     walk VisualEngine -> FakeDataModel -> DataModel");
+                println!("                            through the live client and print names");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -539,6 +547,79 @@ fn run_inspect(args: &Args, count: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn run_chain(args: &Args, pack_path: PathBuf) -> Result<(), String> {
+    let text = std::fs::read_to_string(&pack_path)
+        .map_err(|e| format!("cannot read {}: {e}", pack_path.display()))?;
+    let pack = hpp::Pack::parse(&text);
+
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+    for entry in &pack.entries {
+        offsets.insert(format!("{}::{}", entry.namespace, entry.name), entry.value);
+    }
+
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    println!("zenoscope chain  {module}");
+    println!("  pack         {} ({} entries)", pack_path.display(), pack.entries.len());
+    println!();
+
+    let hops = dump::chain(args.pid, module, &offsets)?;
+    for hop in &hops {
+        let summary = match (hop.name.is_empty(), hop.class.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("  name \"{}\"", hop.name),
+            (true, false) => format!("  class {}", hop.class),
+            (false, false) => format!("  {} [{}]", hop.name, hop.class),
+        };
+        println!(
+            "  {:<32} 0x{:<12X} -> 0x{:<12X}{}",
+            hop.label, hop.address, hop.value, summary
+        );
+    }
+
+    let datamodel = hops
+        .iter()
+        .find(|h| h.label == "VisualEngine -> FakeDataModel")
+        .map(|h| h.value)
+        .unwrap_or(0);
+    let direct = hops
+        .iter()
+        .find(|h| h.label == "FakeDataModel::Pointer")
+        .map(|h| h.value)
+        .unwrap_or(0);
+
+    println!();
+    if datamodel != 0 && direct != 0 {
+        println!(
+            "  cross-check  VisualEngine::FakeDataModel {} FakeDataModel::Pointer",
+            if datamodel == direct {
+                "matches"
+            } else {
+                "DIFFERS from"
+            }
+        );
+    } else {
+        println!("  cross-check  one of the two fake-data-model paths is null");
+    }
+
+    let real = hops
+        .iter()
+        .find(|h| h.label == "FakeDataModel -> RealDataModel")
+        .map(|h| h.value)
+        .unwrap_or(0);
+
+    if real != 0 {
+        println!();
+        println!("  data model children");
+        // The handle is opened inside `chain`; reopen for the walk.
+        let listing = dump::children_of(args.pid, module, &offsets, real, 16)?;
+        for (name, class, address) in &listing {
+            println!("    0x{:<12X} {:<28} [{}]", address, name, class);
+        }
+    }
+
+    Ok(())
+}
+
 fn run_watch(args: &Args, seconds: u64) -> Result<(), String> {
     let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
     println!("zenoscope watch  {module}  {seconds}s");
@@ -792,6 +873,10 @@ fn run() -> Result<(), String> {
 
     if let Some(count) = args.inspect {
         return run_inspect(&args, count);
+    }
+
+    if let Some(pack) = args.chain.clone() {
+        return run_chain(&args, pack);
     }
 
     if let Some(pid) = args.probe {
