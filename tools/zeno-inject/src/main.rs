@@ -133,6 +133,7 @@ fn read_u64(handle: Handle, address: u64) -> u64 {
 /// Point a suspended thread at `stub`, wait for it to publish a result at
 /// `marker`, then put the thread back exactly where it was.
 fn run_stub(handle: Handle, threads: &[u32], stub: u64, marker: u64) -> Option<(u32, u64)> {
+    let mut stuck = 0usize;
     for id in threads.iter().take(24) {
         let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, *id) };
         if thread.is_null() {
@@ -164,10 +165,10 @@ fn run_stub(handle: Handle, threads: &[u32], stub: u64, marker: u64) -> Option<(
         unsafe { ResumeThread(thread) };
 
         let mut value = 0u64;
-        for _ in 0..40 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
             value = read_u64(handle, marker);
-            if value != 0 {
+            if value != 0 && value != SENTINEL && value != ENTERED {
                 break;
             }
         }
@@ -186,6 +187,11 @@ fn run_stub(handle: Handle, threads: &[u32], stub: u64, marker: u64) -> Option<(
             println!("hijack      thread {id} never reached the stub");
         } else if value == ENTERED {
             println!("hijack      thread {id} entered the payload and never came back");
+            stuck += 1;
+            if stuck >= 2 {
+                println!("hijack      payload is stuck; stopping after {stuck} threads");
+                break;
+            }
         } else {
             println!("hijack      thread {id} ran the stub, result 0");
         }
