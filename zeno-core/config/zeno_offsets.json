@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "note": "Offsets shift every Roblox client build. Update this file; no rebuild required.",
+  "build": "version-local",
+  "offsets": {
+    "DataModel": 0,
+    "Workspace": 0,
+    "GameId": 0,
+    "PlaceId": 0,
+    "HttpGet": 0,
+    "ScriptContext": 0,
+    "Identity": 0
+  },
+  "patterns": {
+    "DataModelScan": "48 8B 05 ? ? ? ? 48 8B 88 ? ? ? ? 48 85 C9 74 ? 48 8B 01"
+  }
+}

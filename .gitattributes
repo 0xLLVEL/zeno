@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.dll binary
+*.lib binary
+
+*.rs    text diff=rust
+*.ts    text
+*.tsx   text
+*.cpp   text
+*.h     text
+*.json  text
+*.md    text
