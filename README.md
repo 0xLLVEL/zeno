@@ -210,6 +210,42 @@ offline mode with the prelude's service table.
 
 See `zeno-core/README.md` for the DLL's own notes.
 
+### Where offsets can come from
+
+`tools/zenoscope` resolves anchors from a PE image instead of storing addresses
+by hand. It runs two ways: against a file on disk, and against a live process.
+
+```powershell
+cargo run --manifest-path tools/zenoscope/Cargo.toml --release -- --exe <path>
+cargo run --manifest-path tools/zenoscope/Cargo.toml --release -- --pid <n>
+cargo run --manifest-path tools/zenoscope/Cargo.toml --release -- --probe <pid>
+```
+
+The shipped client is packed. On disk `.text` holds no function prologues at
+all (measured: 0 × `48 89 5C 24` across 106 MB), so the file path can resolve
+RTTI — type descriptors, object locators and vtables live in `.rdata` — but not
+anything that needs real instructions.
+
+Reading a live client from outside does not work either. `--probe` against a
+running `RobloxPlayerBeta.exe` returns:
+
+| access | result |
+|---|---|
+| `PROCESS_TERMINATE` | granted |
+| `PROCESS_QUERY_LIMITED_INFORMATION` | granted |
+| `SYNCHRONIZE` | granted |
+| `PROCESS_VM_READ` | access denied |
+| `PROCESS_VM_WRITE` | access denied |
+| `PROCESS_VM_OPERATION` | access denied |
+| `PROCESS_QUERY_INFORMATION` | access denied |
+| `PROCESS_ALL_ACCESS` | access denied |
+| module enumeration | access denied |
+
+The handle filter refuses every read and write handle opened by another
+process, which rules out external dumpers entirely. Offsets therefore have to
+be resolved from inside the client — where `zeno_inject.dll` already runs —
+and exported through the bridge.
+
 ## Keyboard
 
 | key | action |

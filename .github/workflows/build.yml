@@ -72,6 +72,9 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
+      - name: zenoscope
+        run: cargo build --manifest-path tools/zenoscope/Cargo.toml --release
+
   app:
     name: app
     runs-on: windows-latest

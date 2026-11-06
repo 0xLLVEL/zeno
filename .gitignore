@@ -6,5 +6,7 @@ zeno-core/build/
 zeno-core/out/
 src-tauri/resources/*.dll
 src-tauri/resources/zeno_offsets.json
+tools/zenoscope/target/
+tools/zenoscope/out/
 *.log
 .DS_Store
