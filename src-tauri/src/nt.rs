@@ -424,6 +424,8 @@ pub fn map_view(process: usize, section: usize, protect: u32) -> Result<usize, S
     Ok(base)
 }
 
+/// Used by the tests and by injection cleanup; not yet on a runtime path.
+#[allow(dead_code)]
 pub fn unmap_view(process: usize, base: usize) -> Result<(), String> {
     let Some(addr) = nt!("NtUnmapViewOfSection") else {
         return Err("NtUnmapViewOfSection SSN unresolved".into());

@@ -1,0 +1,117 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  payload:
+    name: payload
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cache luau source
+        uses: actions/cache@v4
+        with:
+          path: zeno-core/build/_deps
+          key: luau-0.653-${{ runner.os }}
+
+      - name: configure
+        run: cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build zeno-core/build --config Release --parallel
+
+      - name: verify output
+        shell: pwsh
+        run: |
+          $dll = "zeno-core/build/zeno_inject.dll"
+          if (-not (Test-Path $dll)) { throw "zeno_inject.dll was not produced" }
+          $size = (Get-Item $dll).Length
+          if ($size -lt 4096) { throw "zeno_inject.dll is implausibly small: $size bytes" }
+          "zeno_inject.dll $size bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payload
+          if-no-files-found: error
+          path: |
+            zeno-core/build/zeno_inject.dll
+            zeno-core/build/zeno_offsets.json
+
+  test:
+    name: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+  app:
+    name: app
+    runs-on: windows-latest
+    needs: payload
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: payload
+          path: src-tauri/resources
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: build app
+        run: npm run tauri:build -- --no-bundle
+
+      - name: verify output
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/release/zeno.exe"
+          if (-not (Test-Path $exe)) { throw "zeno.exe was not produced" }
+          "zeno.exe $((Get-Item $exe).Length) bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeno
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/zeno.exe
+            src-tauri/resources/zeno_inject.dll
+            src-tauri/resources/zeno_offsets.json

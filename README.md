@@ -1,5 +1,7 @@
 # Zeno
 
+[![build](https://github.com/0xLLVEL/zeno/actions/workflows/build.yml/badge.svg)](https://github.com/0xLLVEL/zeno/actions/workflows/build.yml)
+
 Roblox script executor. Tauri 2 + React 18 shell, Rust injector, Luau runtime
 inside the client, named-pipe bridge between them.
 
@@ -27,26 +29,47 @@ tools/gen-icon.cjs   generates icons with zero deps
 
 ## Build
 
+One script does the whole chain on Windows:
+
+```powershell
+.\build.ps1 -Test          # payload, frontend, tests, app (no installer)
+.\build.ps1 -Bundle -Test  # same, plus the NSIS installer
+```
+
+`-SkipPayload` skips CMake, `-SkipUi` skips the frontend build — useful when
+you already have either side built.
+
+Manual equivalent:
+
 ```bash
 npm install
 
-# 1. the injected payload (MSVC 2022 + CMake ≥ 3.20, x64)
-cd zeno-core
-cmake -S . -B build -A x64
-cmake --build build --config Release
-cd ..
+# 1. the injected payload (MSVC 2022 + CMake >= 3.20, x64)
+cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build zeno-core/build --config Release
+copy zeno-core\build\zeno_inject.dll    src-tauri\resources\
+copy zeno-core\build\zeno_offsets.json  src-tauri\resources\
 
 # 2. run the app
 npm run tauri:dev
-```
 
-For a release bundle:
-
-```bash
-copy zeno-core\build\zeno_inject.dll     src-tauri\resources\
-copy zeno-core\config\zeno_offsets.json  src-tauri\resources\
+# 3. or build it
 npm run tauri:build
 ```
+
+### Building without a local toolchain
+
+`.github/workflows/build.yml` runs on `windows-latest`, which already has MSVC
+and CMake:
+
+| job | what it does |
+|---|---|
+| `payload` | CMake build of `zeno_inject.dll`, verified to exist and be non-trivial, uploaded as an artifact |
+| `tests` | `npm run build` then `cargo test --lib` — the syscall and stub tests run here |
+| `app` | downloads the payload into `src-tauri/resources`, then `tauri build --no-bundle`, uploads `zeno.exe` |
+
+The Luau checkout is cached under `zeno-core/build/_deps`, keyed `luau-0.653`,
+so repeat builds skip the clone.
 
 ## Features
 
