@@ -102,13 +102,39 @@ Every ntdll entry point used by `section` and `apc` goes through
 into an explicit error — that denial is what a kernel-level handle filter looks
 like from usermode.
 
+### Stub placement (`src-tauri/src/stub.rs`)
+
+`apc` and `hijack` both need a few dozen bytes of executable code inside the
+target. Allocating one with `NtAllocateVirtualMemory` + `PAGE_EXECUTE_READ`
+works, but that region has no file backing — the one signature an unbacked-
+executable scan is built to find.
+
+`stub::place` avoids it by writing the stub into space that is already inside
+the mapped image:
+
+1. **Real gaps between sections** — the loader-relevant data ends at
+   `VirtualAddress + max(VirtualSize, SizeOfRawData)`; anything up to the next
+   section's `VirtualAddress` is padding. Powered by measured numbers: kernel32
+   has 2384 bytes, user32 3440, dxgi 696.
+2. **Header padding** — the bytes between the end of the section table and the
+   first section (`RVA 0x1000`). Always present, always zero, never referenced
+   by the loader. ntdll has ~0xB00 bytes here.
+
+The page is flipped with `NtProtectVirtualMemory` (RWX, then RW if RWX is
+refused), written, and set back to `PAGE_EXECUTE_READ`. The VAD entry stays the
+image section; only the touched page becomes privately dirty, which is the same
+state any loader-patched import thunk is in.
+
+When neither candidate fits, `stub::place_or_allocate` falls back to a private
+RX allocation rather than failing the injection.
+
 ## Anti-cheat scope
 
 Be clear about what the injection layer does and does not cover:
 
 | vector | covered |
 |---|---|
-| unbacked executable memory | yes, for the payload itself — `section` / `apc` / `hijack` |
+| unbacked executable memory | yes — payload is image-backed, stubs go into image slack |
 | remote module list (LoadLibrary) | yes, by `manualmap` / `section` / `apc` / `hijack` |
 | ntdll hooks on NT calls | yes, by `nt` direct syscalls |
 | thread-creation notification (kernel) | yes — `apc` and `hijack` create no thread |
@@ -117,10 +143,8 @@ Be clear about what the injection layer does and does not cover:
 | image-load notification (kernel) | partially — section maps are real image views |
 | `.text` integrity checks | **no** |
 
-Both `apc` and `hijack` still write one small RX stub into the target. It has no
-file backing, so a strict unbacked-executable scan sees it even though the
-payload image itself is file-backed. Moving that stub inside the mapped view is
-the next increment.
+The remaining open vector is the fallback allocation, which only runs when the
+image has no gap wide enough for the stub.
 
 Hyperion (Byfron) on the Windows client ships a kernel component that owns
 handle filtering and `.text` page integrity. Usermode-only injection does not

@@ -8,8 +8,8 @@
 //! already exist. No `NtCreateThreadEx`, so thread-creation notification never
 //! fires; the work happens on a thread Roblox itself created.
 //!
-//! The stub is small but it is still unbacked executable memory. That is the
-//! trade: fewer threads, one more RWX region.
+//! The stub is written into image slack via `crate::stub`, so the injection
+//! adds no separate executable allocation.
 
 use std::path::Path;
 
@@ -82,9 +82,8 @@ pub fn inject(pid: u32, dll: &Path) -> Result<String, String> {
             let base = nt::map_view(process, section, nt::PAGE_RO)?;
             let entry = base + entry_rva as usize;
 
-            let stub_mem = nt::allocate(process, 64)?;
-            nt::write(process, stub_mem, &build_stub(base, entry))?;
-            nt::protect(process, stub_mem, 64, nt::PAGE_RX)?;
+            let stub = build_stub(base, entry);
+            let stub_mem = crate::stub::place_or_allocate(process, base, dll, &stub, 64)?;
 
             let targets = threads_of(pid);
             if targets.is_empty() {

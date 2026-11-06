@@ -228,6 +228,7 @@ pub const MEM_RESERVE_BIT: u32 = 0x2000;
 pub const PAGE_RW: u32 = 0x04;
 pub const PAGE_RX: u32 = 0x20;
 pub const PAGE_RO: u32 = 0x02;
+pub const PAGE_RWX: u32 = 0x40;
 
 pub fn available() -> bool {
     ssn("NtOpenProcess").is_some()

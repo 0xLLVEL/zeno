@@ -13,8 +13,8 @@
 //! thread enters an alertable wait, which Roblox threads rarely do; hijack has
 //! no such precondition.
 //!
-//! Not covered: handle filtering and `.text` integrity. The stub itself is one
-//! unbacked RX page, the same trade `apc` makes.
+//! Not covered: handle filtering and `.text` integrity. The stub is written
+//! into image slack via `crate::stub`, so it does not add an unbacked RX page.
 
 use std::path::Path;
 
@@ -115,7 +115,7 @@ pub fn inject(pid: u32, dll: &Path) -> Result<String, String> {
 
             let mut last_error = String::from("no thread accepted the hijack");
             for tid in candidates.iter().take(32) {
-                match hijack_one(process, *tid, base, entry) {
+                match hijack_one(process, *tid, base, entry, dll) {
                     Ok(()) => return Ok(format!("hijacked thread {tid}")),
                     Err(e) => last_error = format!("thread {tid}: {e}"),
                 }
@@ -137,7 +137,7 @@ pub fn inject(pid: u32, dll: &Path) -> Result<String, String> {
     result
 }
 
-fn hijack_one(process: usize, tid: u32, base: usize, entry: usize) -> Result<(), String> {
+fn hijack_one(process: usize, tid: u32, base: usize, entry: usize, dll: &Path) -> Result<(), String> {
     let access = nt::THREAD_SUSPEND_RESUME
         | nt::THREAD_GET_CONTEXT
         | nt::THREAD_SET_CONTEXT
@@ -156,12 +156,10 @@ fn hijack_one(process: usize, tid: u32, base: usize, entry: usize) -> Result<(),
                 return Err(format!("implausible Rip {original_rip:#x}"));
             }
 
-            let stub_mem = nt::allocate(process, STUB_SIZE)?;
             let scratch = nt::allocate(process, SCRATCH_SIZE)?;
 
             let stub = build_stub(base, entry, original_rip, scratch + SCRATCH_SIZE);
-            nt::write(process, stub_mem, &stub)?;
-            nt::protect(process, stub_mem, STUB_SIZE, nt::PAGE_RX)?;
+            let stub_mem = crate::stub::place_or_allocate(process, base, dll, &stub, STUB_SIZE)?;
 
             nt::set_context_rip(&mut context, stub_mem as u64);
             nt::set_thread_context(thread, &context)?;

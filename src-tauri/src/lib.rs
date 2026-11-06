@@ -16,6 +16,8 @@ mod pipe;
 mod process;
 #[cfg(windows)]
 mod section;
+#[cfg(windows)]
+mod stub;
 
 use std::sync::Mutex;
 
