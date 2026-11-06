@@ -390,6 +390,29 @@ fn probe() -> String {
         mark("scan done");
     }
 
+    // Same idea, but across the whole private working set: the Lua heap is not
+    // required to live next to the ScriptContext.
+    if candidates.is_empty() && config_dir().join("scan-all").is_file() {
+        let cap = fs::read_to_string(config_dir().join("scan-cap-mb.txt"))
+            .ok()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .unwrap_or(1024)
+            * 1024
+            * 1024;
+        out.push_str("\nfull scan\n");
+        let (hits, scanned) = scan_all_regions(handle, cap, &[exe, context & !0xFFF]);
+        out.push_str(&format!("  scanned 0x{scanned:X} bytes\n"));
+        out.push_str(&format!("  hits {}\n", hits.len()));
+        for (state, global) in hits.iter().take(8) {
+            out.push_str(&format!("  state 0x{state:X}  global 0x{global:X}\n"));
+        }
+        if hits.is_empty() {
+            out.push_str("  none\n");
+        }
+        candidates.extend(hits.into_iter().take(1));
+        mark("full scan done");
+    }
+
     // `ScriptContext+0x1B8` holds the main `lua_State` on this build. Dump the
     // state and its `global_State` so the VM's member offsets can be read off
     // real bytes instead of guessed from a layout that changes every release.
@@ -551,6 +574,44 @@ fn region_of(address: u64) -> (u64, usize) {
         return (address, 0);
     }
     (info.base, info.region_size as usize)
+}
+
+/// Walk every committed private region in the process and stop as soon as the
+/// thread signature shows up. `lua_State` is not guaranteed to sit in the same
+/// arena as the ScriptContext, so the search cannot be scoped to one region.
+fn scan_all_regions(handle: Handle, cap: usize, skip: &[u64]) -> (Vec<(u64, u64)>, usize) {
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    let mut address = 0x10000u64;
+    let ceiling = 0x7FFF_FFFF_FFFFu64;
+
+    while address < ceiling && scanned < cap {
+        let mut info: MemoryBasicInformation = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<MemoryBasicInformation>();
+        let ok = unsafe { VirtualQuery(address as *const c_void, &mut info, size) };
+        if ok == 0 || info.region_size == 0 {
+            address += 0x1000;
+            continue;
+        }
+        let next = info.base + info.region_size;
+        let readable = info.state == 0x1000
+            && (info.kind == 0x20000 || info.kind == 0x40000)
+            && info.protect & 0x100 == 0
+            && info.protect & 0x01 == 0;
+        let skipped = skip
+            .iter()
+            .any(|base| info.base >= *base && info.base < *base + 0x400000);
+        if readable && !skipped {
+            let len = (info.region_size as usize).min(0x4000000);
+            hits.extend(scan_region_for_threads(handle, info.base, len));
+            scanned += len;
+            if !hits.is_empty() {
+                break;
+            }
+        }
+        address = next;
+    }
+    (hits, scanned)
 }
 
 fn hex_dump(label: &str, bytes: &[u8], base: u64) -> String {    let mut out = String::new();

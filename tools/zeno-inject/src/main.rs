@@ -115,6 +115,20 @@ extern "system" {
     fn SetThreadContext(thread: Handle, context: *const c_void) -> i32;
 }
 
+const PROCESS_QUERY_LIMITED: u32 = 0x1000;
+const PROCESS_VM_READ: u32 = 0x0010;
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        handle: Handle,
+        class: u32,
+        info: *mut c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
+}
+
 struct Module {
     name: String,
     base: u64,
@@ -122,26 +136,73 @@ struct Module {
 }
 
 fn modules_of(pid: u32) -> Vec<Module> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) };
-    if snapshot.is_null() || snapshot == -1isize as Handle {
+    // Toolhelp is refused for this process, so the loader list is read straight
+    // out of the target's PEB: PEB -> Ldr -> InMemoryOrderModuleList.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
         return Vec::new();
     }
-    let mut entry: ModuleEntry32 = unsafe { std::mem::zeroed() };
-    entry.dw_size = std::mem::size_of::<ModuleEntry32>() as u32;
+    let mut info = [0u8; 0x30];
+    let mut returned = 0u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            0,
+            info.as_mut_ptr() as *mut c_void,
+            info.len() as u32,
+            &mut returned,
+        )
+    };
+    if status < 0 {
+        unsafe { CloseHandle(handle) };
+        return Vec::new();
+    }
+    let peb = u64::from_le_bytes(info[8..16].try_into().unwrap());
+    let ldr = read_u64(handle, peb + 0x18);
+    if ldr == 0 {
+        unsafe { CloseHandle(handle) };
+        return Vec::new();
+    }
 
     let mut out = Vec::new();
-    let mut ok = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
-    while ok {
-        let end = entry.sz_module.iter().position(|b| *b == 0).unwrap_or(256);
-        let name = String::from_utf8_lossy(&entry.sz_module[..end]).to_lowercase();
-        out.push(Module {
-            name,
-            base: entry.mod_base as u64,
-            size: entry.mod_base_size as u64,
-        });
-        ok = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
+    let list_head = ldr + 0x20;
+    let mut link = read_u64(handle, list_head);
+    for _ in 0..256 {
+        if link == 0 || link == list_head {
+            break;
+        }
+        let entry = link.wrapping_sub(0x10);
+        let base = read_u64(handle, entry + 0x30);
+        let size = read_u64(handle, entry + 0x38) & 0xFFFF_FFFF;
+        let name_len = read_u64(handle, entry + 0x58) & 0xFFFF;
+        let name_ptr = read_u64(handle, entry + 0x60);
+        let mut name = String::new();
+        if name_len > 0 && name_len < 0x200 && name_ptr != 0 {
+            let mut raw = vec![0u8; name_len as usize];
+            let mut got = 0usize;
+            let ok = unsafe {
+                ReadProcessMemory(
+                    handle,
+                    name_ptr as *const c_void,
+                    raw.as_mut_ptr() as *mut c_void,
+                    raw.len(),
+                    &mut got,
+                )
+            };
+            if ok != 0 {
+                let units: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                name = String::from_utf16_lossy(&units).to_lowercase();
+            }
+        }
+        if base != 0 && size != 0 {
+            out.push(Module { name, base, size });
+        }
+        link = read_u64(handle, link);
     }
-    unsafe { CloseHandle(snapshot) };
+    unsafe { CloseHandle(handle) };
     out
 }
 
@@ -240,7 +301,16 @@ fn run_stub(
         .map(|id| (thread_rip(handle, *id).map(|rip| hijack_rank(rip, modules)).unwrap_or(3), *id))
         .collect();
     ordered.sort_by_key(|entry| entry.0);
-    let ranked: Vec<u32> = ordered.into_iter().map(|entry| entry.1).collect();
+    let parked: Vec<u32> = ordered
+        .iter()
+        .filter(|entry| entry.0 <= 1)
+        .map(|entry| entry.1)
+        .collect();
+    let ranked: Vec<u32> = if parked.len() >= 3 {
+        parked
+    } else {
+        ordered.into_iter().map(|entry| entry.1).collect()
+    };
 
     let mut stuck = 0usize;
     for id in ranked.iter().take(24) {
