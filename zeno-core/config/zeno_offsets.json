@@ -1,15 +1,33 @@
 {
-  "schema": 1,
-  "note": "Offsets shift every Roblox client build. Update this file; no rebuild required.",
-  "build": "version-local",
+  "schema": 2,
+  "note": "Offsets shift every Roblox client build. Update this file; no rebuild required. Values are hex.",
+  "client": "version-f0ea5da9412f4e35",
+  "source": "offsets.imtheo.lol (RbxDumperV2 2.2.4)",
   "offsets": {
-    "DataModel": 0,
-    "Workspace": 0,
-    "GameId": 0,
-    "PlaceId": 0,
-    "HttpGet": 0,
-    "ScriptContext": 0,
-    "Identity": 0
+    "Instance.Name": "0x0",
+    "Instance.ClassName": "0x8",
+    "Instance.ClassDescriptor": "0x18",
+    "Instance.Parent": "0x60",
+    "Instance.NameContainer": "0x68",
+    "Instance.ChildrenStart": "0x70",
+    "Instance.ClassBase": "0x1b0",
+    "DataModel.Workspace": "0x148",
+    "DataModel.ScriptContext": "0x440",
+    "DataModel.GameId": "0x178",
+    "DataModel.PlaceId": "0x180",
+    "DataModel.JobId": "0x108",
+    "DataModel.GameLoaded": "0x588",
+    "FakeDataModel.RealDataModel": "0x1f8",
+    "VisualEngine.FakeDataModel": "0xaf0",
+    "VisualEngine.RenderView": "0xc50",
+    "VisualEngine.ViewMatrix": "0x1b0",
+    "VisualEngine.Dimensions": "0xb10",
+    "Instance.ChildrenEndUnverified": "0x8"
+  },
+  "globals": {
+    "TaskScheduler.Pointer": "0x8e4d7b8",
+    "FakeDataModel.Pointer": "0x8eb6960",
+    "VisualEngine.Pointer": "0x8942e38"
   },
   "patterns": {
     "DataModelScan": "48 8B 05 ? ? ? ? 48 8B 88 ? ? ? ? 48 85 C9 74 ? 48 8B 01"

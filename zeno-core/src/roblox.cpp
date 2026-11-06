@@ -47,7 +47,7 @@ void parse_config(const std::string& text) {
         if (!value.empty() && value.back() == ',') value.pop_back();
         if (key.empty() || value.empty()) continue;
 
-        if (section == "offsets") {
+        if (section == "offsets" || section == "globals") {
             try {
                 g_offsets[key] = static_cast<uintptr_t>(std::stoull(value, nullptr, 0));
             } catch (...) {
@@ -96,6 +96,20 @@ uintptr_t resolve_pattern_scan(std::string_view signature) {
     return 0;
 }
 
+// Preferred path: the pack publishes the RVAs of the engine's global slots, so
+// the data model is three reads away. The pattern scan below is the fallback
+// for builds the pack does not cover.
+uintptr_t resolve_datamodel_from_globals() {
+    const auto slot = offset("FakeDataModel.Pointer");
+    const auto real_offset = offset("FakeDataModel.RealDataModel");
+    if (slot == 0 || real_offset == 0) return 0;
+
+    const auto fake = read_or<uintptr_t>(module_base() + slot, 0);
+    if (fake == 0) return 0;
+
+    return read_or<uintptr_t>(fake + real_offset, 0);
+}
+
 uintptr_t resolve_datamodel() {
     const auto pattern = g_patterns.find("DataModelScan");
     if (pattern == g_patterns.end()) return 0;
@@ -129,7 +143,10 @@ bool init() {
             parse_config(buffer.str());
         }
 
-        g_datamodel = resolve_datamodel();
+        g_datamodel = resolve_datamodel_from_globals();
+        if (g_datamodel == 0) {
+            g_datamodel = resolve_datamodel();
+        }
         g_ready = true;
     });
     return g_ready;
