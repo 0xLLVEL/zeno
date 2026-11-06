@@ -239,6 +239,44 @@ int l_datamodel(lua_State* L) {
     return 1;
 }
 
+int l_instance_name(lua_State* L) {
+    const auto address = static_cast<uintptr_t>(luaL_checknumber(L, 1));
+    const std::string name = zeno::rbx::instance_name(address);
+    lua_pushlstring(L, name.data(), name.size());
+    return 1;
+}
+
+int l_instance_class(lua_State* L) {
+    const auto address = static_cast<uintptr_t>(luaL_checknumber(L, 1));
+    const std::string name = zeno::rbx::instance_class_name(address);
+    lua_pushlstring(L, name.data(), name.size());
+    return 1;
+}
+
+int l_instance_parent(lua_State* L) {
+    const auto address = static_cast<uintptr_t>(luaL_checknumber(L, 1));
+    lua_pushnumber(L, static_cast<double>(zeno::rbx::instance_parent(address)));
+    return 1;
+}
+
+int l_instance_children(lua_State* L) {
+    const auto address = static_cast<uintptr_t>(luaL_checknumber(L, 1));
+    const auto children = zeno::rbx::instance_children(address);
+    lua_createtable(L, static_cast<int>(children.size()), 0);
+    for (size_t i = 0; i < children.size(); ++i) {
+        lua_pushnumber(L, static_cast<double>(children[i]));
+        lua_rawseti(L, -2, static_cast<int>(i + 1));
+    }
+    return 1;
+}
+
+int l_find_child(lua_State* L) {
+    const auto address = static_cast<uintptr_t>(luaL_checknumber(L, 1));
+    const char* name = luaL_checkstring(L, 2);
+    lua_pushnumber(L, static_cast<double>(zeno::rbx::find_child(address, name)));
+    return 1;
+}
+
 int l_spawn(lua_State* L) {
     Executor::instance().spawn_from(L, 0);
     return 0;
@@ -271,6 +309,11 @@ void install_api(lua_State* L) {
     reg(L, "zeno_capability", l_capability);
     reg(L, "zeno_read_ptr", l_read_ptr);
     reg(L, "zeno_datamodel", l_datamodel);
+    reg(L, "zeno_instance_name", l_instance_name);
+    reg(L, "zeno_instance_class", l_instance_class);
+    reg(L, "zeno_instance_parent", l_instance_parent);
+    reg(L, "zeno_instance_children", l_instance_children);
+    reg(L, "zeno_find_child", l_find_child);
 
     lua_newtable(L);
     int idx = 1;
