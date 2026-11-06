@@ -13,3 +13,4 @@ tools/zeno-inject/target/
 tools/zeno-payload/target/
 *.log
 .DS_Store
+tools/zeno-payload/.cargo/target/

@@ -1,0 +1,11 @@
+[package]
+name = "zeno-inject"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zeno-inject"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
