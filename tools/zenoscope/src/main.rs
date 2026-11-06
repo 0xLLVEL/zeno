@@ -189,6 +189,24 @@ struct Loaded {
     notes: Vec<String>,
 }
 
+fn load_file(path: PathBuf) -> Result<Loaded, String> {
+    let data = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let bytes = data.len() as u64;
+    let origin = path.display().to_string();
+    let version = client_version(&origin);
+    let image = PeImage::parse(data)?;
+
+    Ok(Loaded {
+        source: "file".into(),
+        origin,
+        version,
+        bytes,
+        image: Box::new(image),
+        unreadable: 0,
+        notes: Vec::new(),
+    })
+}
+
 fn load(args: &Args) -> Result<Loaded, String> {
     let mut notes = Vec::new();
 
@@ -230,22 +248,205 @@ fn load(args: &Args) -> Result<Loaded, String> {
         })?,
     };
 
-    let data = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let bytes = data.len() as u64;
-    let origin = path.display().to_string();
-    let version = client_version(&origin);
-    let image = PeImage::parse(data)?;
-
-    Ok(Loaded {
-        source: "file".into(),
-        origin,
-        version,
-        bytes,
-        image: Box::new(image),
-        unreadable: 0,
-        notes,
-    })
+    let mut loaded = load_file(path)?;
+    loaded.notes = notes;
+    Ok(loaded)
 }
+
+// ------------------------------------------------------------------- verify
+
+/// A pack entry whose value is a module-relative address rather than a struct
+/// offset. Anything past 1 MiB is past the largest sensible member offset.
+const RVA_FLOOR: u64 = 0x10_0000;
+
+struct SlotReport {
+    namespace: String,
+    name: String,
+    rva: u64,
+    section: Option<String>,
+    writable: bool,
+    aligned: bool,
+    at_rest: String,
+}
+
+fn at_rest(image: &dyn Image, rva: u64) -> String {
+    let rva = match u32::try_from(rva) {
+        Ok(v) => v,
+        Err(_) => return "outside the image".into(),
+    };
+    match image.read_u64(rva) {
+        None => "not file-backed (zeroed at load)".into(),
+        Some(0) => "zero at rest".into(),
+        Some(value) => {
+            let inside = image.rva_of_va(value).is_some();
+            if inside {
+                format!("live value 0x{value:X} (points into this image)")
+            } else {
+                format!("live value 0x{value:X} (points outside this image)")
+            }
+        }
+    }
+}
+
+fn slot_report(image: &dyn Image, entry: &hpp::Entry) -> SlotReport {
+    let rva32 = u32::try_from(entry.value).ok();
+    let section = rva32.and_then(|rva| image.section_for_rva(rva));
+    SlotReport {
+        namespace: entry.namespace.clone(),
+        name: entry.name.clone(),
+        rva: entry.value,
+        section: section.map(|s| s.name.clone()),
+        writable: section.map(|s| s.is_writable()).unwrap_or(false),
+        aligned: entry.value % 8 == 0,
+        at_rest: at_rest(image, entry.value),
+    }
+}
+
+fn value_of(pack: &hpp::Pack, namespace: &str, name: &str) -> Option<u64> {
+    pack.entries
+        .iter()
+        .find(|e| e.namespace == namespace && e.name == name)
+        .map(|e| e.value)
+}
+
+fn verify_pack(path: &PathBuf, image: &dyn Image, client: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let pack = hpp::Pack::parse(&text);
+
+    let pack_version = pack.client_version.clone().unwrap_or_else(|| "unknown".into());
+    let version_match = pack_version == client;
+
+    println!("zenoscope verify  {}", path.display());
+    println!("  client on disk    {client}");
+    println!("  pack version      {pack_version}");
+    println!(
+        "  version match     {}",
+        if version_match { "yes" } else { "NO — offsets are for another build" }
+    );
+    println!("  entries           {}", pack.entries.len());
+
+    let slots: Vec<&hpp::Entry> = pack
+        .entries
+        .iter()
+        .filter(|e| e.value >= RVA_FLOOR)
+        .collect();
+
+    println!();
+    println!("module-relative slots");
+    if slots.is_empty() {
+        println!("  none — every entry is a struct offset");
+    }
+    let mut slots_ok = 0usize;
+    for entry in &slots {
+        let report = slot_report(image, entry);
+        let usable = report.writable && report.aligned && report.section.is_some();
+        if usable {
+            slots_ok += 1;
+        }
+        println!(
+            "  {}::{:<22} rva 0x{:<9X} {:<8} {:<3} {:<9} {}",
+            report.namespace,
+            report.name,
+            report.rva,
+            report.section.as_deref().unwrap_or("none"),
+            if report.writable { "rw" } else { "ro" },
+            if report.aligned { "aligned" } else { "MISALIGNED" },
+            report.at_rest
+        );
+    }
+    if !slots.is_empty() {
+        println!("  {slots_ok}/{} resolve to a writable, aligned global", slots.len());
+    }
+
+    // ------------------------------------------------------------ structure
+    println!();
+    println!("structure");
+    let mut problems: Vec<String> = Vec::new();
+    let mut checks = 0usize;
+
+    let mut check = |label: String, passed: bool, detail: String| {
+        checks += 1;
+        if !passed {
+            problems.push(label.clone());
+        }
+        println!("  {:<40} {} {}", label, if passed { "ok  " } else { "WARN" }, detail);
+    };
+
+    match (value_of(&pack, "Instance", "Name"), value_of(&pack, "Instance", "ChildrenStart"), value_of(&pack, "Instance", "ChildrenEnd")) {
+        (Some(name), Some(start), Some(end)) => {
+            check(
+                "Instance::Name is offset zero".into(),
+                name == 0,
+                format!("0x{name:X}"),
+            );
+            check(
+                "ChildrenEnd is past ChildrenStart".into(),
+                end > start,
+                format!("0x{start:X} -> 0x{end:X}"),
+            );
+            check(
+                "ChildrenStart is pointer aligned".into(),
+                start % 8 == 0,
+                format!("0x{start:X}"),
+            );
+        }
+        _ => check(
+            "Instance layout is complete".into(),
+            false,
+            "missing keys".into(),
+        ),
+    }
+
+    for (namespace, name) in [
+        ("DataModel", "Workspace"),
+        ("DataModel", "ScriptContext"),
+        ("FakeDataModel", "RealDataModel"),
+        ("VisualEngine", "FakeDataModel"),
+    ] {
+        match value_of(&pack, namespace, name) {
+            Some(v) => check(
+                format!("{namespace}::{name} is a member offset"),
+                v < RVA_FLOOR,
+                format!("0x{v:X}"),
+            ),
+            None => check(
+                format!("{namespace}::{name} present"),
+                false,
+                "missing".into(),
+            ),
+        }
+    }
+
+    for mangled in RTTI_TARGETS {
+        let known = resolve_rtti(image, mangled).is_some();
+        check(
+            format!("RTTI contains {mangled}"),
+            known,
+            if known { "resolved".into() } else { "absent".into() },
+        );
+    }
+
+    println!();
+    println!(
+        "  checks            {}/{} passed",
+        checks.saturating_sub(problems.len()),
+        checks
+    );
+    println!(
+        "  verdict           {}",
+        if version_match && problems.is_empty() {
+            "compatible with this client"
+        } else if !version_match {
+            "incompatible: pack targets a different client build"
+        } else {
+            "version matches but the layout has oddities"
+        }
+    );
+
+    Ok(())
+}
+
 
 fn main() {
     if let Err(message) = run() {
@@ -282,6 +483,16 @@ fn run() -> Result<(), String> {
             ),
         }
         return Ok(());
+    }
+
+    if let Some(path) = &args.verify {
+        let exe = match &args.exe {
+            Some(path) => path.clone(),
+            None => find_client_file()
+                .ok_or_else(|| format!("{CLIENT_EXE} not found; pass --exe <path>"))?,
+        };
+        let loaded = load_file(exe)?;
+        return verify_pack(path, loaded.image.as_ref(), &loaded.version);
     }
 
     let loaded = load(&args)?;

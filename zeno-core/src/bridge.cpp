@@ -12,8 +12,8 @@
 namespace zeno::bridge {
 namespace {
 
-constexpr wchar_t* kInPipe = L"\\\\.\\pipe\\zeno_in";
-constexpr wchar_t* kOutPipe = L"\\\\.\\pipe\\zeno_out";
+constexpr const wchar_t* kInPipe = L"\\\\.\\pipe\\zeno_in";
+constexpr const wchar_t* kOutPipe = L"\\\\.\\pipe\\zeno_out";
 
 std::mutex g_out_mutex;
 std::deque<std::string> g_out_queue;

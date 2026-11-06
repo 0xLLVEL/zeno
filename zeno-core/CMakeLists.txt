@@ -15,6 +15,7 @@ include(FetchContent)
 if(DEFINED ENV{LUAU_SRC_DIR} AND EXISTS "$ENV{LUAU_SRC_DIR}/CMakeLists.txt")
   message(STATUS "Using local Luau at $ENV{LUAU_SRC_DIR}")
   add_subdirectory("$ENV{LUAU_SRC_DIR}" "${CMAKE_BINARY_DIR}/luau")
+  set(ZENO_LUAU_DIR "$ENV{LUAU_SRC_DIR}")
 else()
   FetchContent_Declare(
     luau
@@ -26,6 +27,7 @@ else()
   set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LUAU_BUILD_CLI OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(luau)
+  set(ZENO_LUAU_DIR "${luau_SOURCE_DIR}")
 endif()
 
 # ---------------------------------------------------------------- target
@@ -36,6 +38,10 @@ add_library(zeno_inject SHARED ${ZENO_SOURCES})
 target_include_directories(zeno_inject PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+  "${ZENO_LUAU_DIR}/VM/include"
+  "${ZENO_LUAU_DIR}/Compiler/include"
+  "${ZENO_LUAU_DIR}/Ast/include"
+  "${ZENO_LUAU_DIR}/Common/include"
 )
 
 target_compile_definitions(zeno_inject PRIVATE
