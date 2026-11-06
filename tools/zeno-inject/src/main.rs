@@ -149,6 +149,7 @@ extern "system" {
         protect: u32,
     ) -> i32;
     fn NtClose(handle: Handle) -> i32;
+    fn NtUnmapViewOfSection(process: Handle, base: *mut c_void) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -968,11 +969,351 @@ fn link_module(
     Ok(())
 }
 
-fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result<(), String> {
+/// What the image test should do with the mapped view.
+#[derive(Clone, Copy, Default)]
+struct ImageOpts {
+    /// Resolve and patch the IAT from this process.
+    load: bool,
+    /// Hijack a thread into the payload. Without it the view is only mapped.
+    exec: bool,
+    /// Splice an `LDR_DATA_TABLE_ENTRY` into the loader lists.
+    link: bool,
+    /// Unmap the view once the call returns, before the next scan can see it.
+    unmap: bool,
+}
+
+/// Does nothing but name what it did, then watch the process for a minute.
+///
+/// Every injection shape tried so far has ended the client, and they all share
+/// three syscalls: `OpenProcess`, `VirtualAllocEx`, `WriteProcessMemory`. The
+/// mapping-only run proves the mapped view is not what dies at t+30s — it dies
+/// without a byte of it ever running. This isolates which syscall the client
+/// objects to.
+fn touch_test(pid: u32, alloc: bool, write: bool) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let mut notes = String::from("open");
+    let mut block = std::ptr::null_mut();
+
+    if alloc {
+        block = unsafe {
+            VirtualAllocEx(handle, std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, 0x04)
+        };
+        if block.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err(format!("VirtualAllocEx failed ({})", unsafe { GetLastError() }));
+        }
+        notes.push_str(&format!(" alloc 0x{:X}", block as u64));
+    }
+
+    if write {
+        if alloc {
+            let mut written = 0usize;
+            let ok = unsafe {
+                WriteProcessMemory(
+                    handle,
+                    block,
+                    &0x5EED_5EEDu64 as *const u64 as *const c_void,
+                    8,
+                    &mut written,
+                )
+            };
+            notes.push_str(&format!(" write {ok} at 0x{:X}", block as u64));
+        } else {
+            // Nothing allocated: a read is the only safe probe.
+            let peb = read_u64_checked(handle, 0x7FFF_FFFF_FFFF).unwrap_or(0);
+            notes.push_str(&format!(" read-probe {peb:X}"));
+        }
+    }
+
+    println!("touch       {notes}");
+
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "touch       t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Hijacks one thread into `target(arg)` and leaves it parked in `SleepEx`.
+///
+/// Returns the thread's original context so the caller can put it back; a
+/// thread left at a foreign RIP is an anomaly the client can see.
+struct Parked {
+    id: u32,
+    context: Vec<u8>,
+}
+
+fn hijack(
+    handle: Handle,
+    pid: u32,
+    modules: &[Module],
+    target: u64,
+    arg: u64,
+    stack_top: u64,
+    park: u64,
+) -> Option<Parked> {
+    let mut ordered: Vec<(u8, u32)> = threads_of(pid)
+        .into_iter()
+        .take(64)
+        .map(|id| {
+            (
+                thread_rip(handle, id)
+                    .map(|rip| hijack_rank(rip, modules))
+                    .unwrap_or(3),
+                id,
+            )
+        })
+        .collect();
+    ordered.sort_by_key(|entry| entry.0);
+
+    for (rank, id) in ordered {
+        if rank > 2 {
+            break;
+        }
+        let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+        if thread.is_null() {
+            continue;
+        }
+        unsafe { SuspendThread(thread) };
+        let mut original = vec![0u8; CONTEXT_SIZE];
+        unsafe {
+            *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+        }
+        if unsafe { GetThreadContext(thread, original.as_mut_ptr() as *mut c_void) } == 0 {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            }
+            continue;
+        }
+        let mut patched = original.clone();
+        unsafe {
+            *(patched.as_mut_ptr().add(0xF8) as *mut u64) = target;
+            *(patched.as_mut_ptr().add(0x98) as *mut u64) = stack_top;
+            *(patched.as_mut_ptr().add(0x78) as *mut u64) = arg;
+            *(patched.as_mut_ptr().add(0x80) as *mut u64) = 0;
+        }
+        if unsafe { SetThreadContext(thread, patched.as_ptr() as *const c_void) } == 0 {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            }
+            continue;
+        }
+        unsafe { ResumeThread(thread) };
+        unsafe { CloseHandle(thread) };
+        let _ = park;
+        return Some(Parked { id, context: original });
+    }
+    None
+}
+
+fn unpark(handle: Handle, parked: &Parked) {
+    let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, parked.id) };
+    if thread.is_null() {
+        return;
+    }
+    unsafe {
+        SuspendThread(thread);
+        SetThreadContext(thread, parked.context.as_ptr() as *const c_void);
+        ResumeThread(thread);
+        CloseHandle(thread);
+    }
+}
+
+fn threads_of_unchecked(_handle: Handle) -> Vec<u32> {
+    Vec::new()
+}
+
+
+/// Maps the payload over a registered module's image instead of creating a new
+/// section.
+///
+/// Every unregistered `SEC_IMAGE` view has been killed — mapping alone, no code
+/// run, payload or signed Microsoft DLL alike — while `OpenProcess`,
+/// `VirtualAllocEx` and `WriteProcessMemory` all survive a full minute. So the
+/// check is "image view that no loader entry points at", and the only way past
+/// it is to live inside a module the loader already knows.
+fn hollow_test(
+    pid: u32,
+    payload: &std::path::Path,
+    carrier: Option<&str>,
+) -> Result<(), String> {
+    let file = std::fs::read(payload).map_err(|e| format!("{}: {e}", payload.display()))?;
+    let image_size = map::image_size(&file)?;
+    let ping_rva = map::export_rva(&file, "zeno_ping").ok_or("zeno_ping export missing")?;
+    println!("hollow      payload {image_size} bytes, ping rva 0x{ping_rva:X}");
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+
+    let stack = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x8000, MEM_COMMIT_RESERVE, 0x04)
+    };
+    if stack.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("stack allocation failed".into());
+    }
+    let stack_top = stack as u64 + 0x8000 - 0x10;
+    let kernel32 = unsafe { GetModuleHandleW(wide("kernel32.dll").as_ptr()) };
+    let park = unsafe { GetProcAddress(kernel32, b"SleepEx\0".as_ptr()) } as u64;
+    let load_library = unsafe { GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr()) } as u64;
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            (stack_top - 8) as *mut c_void,
+            &park as *const u64 as *const c_void,
+            8,
+            &mut written,
+        )
+    };
+
+    let candidates: Vec<String> = match carrier {
+        Some(name) => vec![name.to_string()],
+        None => [
+            r"C:\Windows\System32\WindowsCodecs.dll",
+            r"C:\Windows\System32\msmpeg2vdec.dll",
+            r"C:\Windows\System32\NaturalLanguage6.dll",
+            r"C:\Windows\System32\mscms.dll",
+            r"C:\Windows\System32\wmvdspa.dll",
+            r"C:\Windows\System32\mswsock.dll",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    };
+
+    let mut chosen: Option<(String, u64, u64)> = None;
+    for candidate in candidates {
+        let short = candidate.rsplit('\\').next().unwrap_or(&candidate).to_string();
+        let before = modules_of(pid);
+        if !before.iter().any(|module| module.name.eq_ignore_ascii_case(&short)) {
+            let text = wide(&candidate);
+            let buffer = unsafe {
+                VirtualAllocEx(
+                    handle,
+                    std::ptr::null_mut(),
+                    text.len() * 2 + 0x10,
+                    MEM_COMMIT_RESERVE,
+                    0x04,
+                )
+            };
+            if buffer.is_null() {
+                continue;
+            }
+            unsafe {
+                WriteProcessMemory(
+                    handle,
+                    buffer,
+                    text.as_ptr() as *const c_void,
+                    text.len() * 2,
+                    &mut written,
+                )
+            };
+            let Some(parked) = hijack(handle, pid, &before, load_library, buffer as u64, stack_top - 8, park)
+            else {
+                continue;
+            };
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            unpark(handle, &parked);
+            println!("hollow      loaded {short}");
+        }
+
+        let after = modules_of(pid);
+        if let Some(module) = after.iter().find(|m| m.name.eq_ignore_ascii_case(&short)) {
+            println!(
+                "hollow      carrier {short} base 0x{:X} size 0x{:X}",
+                module.base, module.size
+            );
+            if module.size >= image_size as u64 {
+                chosen = Some((short, module.base, module.size));
+                break;
+            }
+            println!("hollow      too small for the payload, next");
+        }
+    }
+
+    let Some((name, base, size)) = chosen else {
+        unsafe { CloseHandle(handle) };
+        return Err("no carrier large enough".into());
+    };
+    println!("hollow      hollowing {name} at 0x{base:X}");
+
+    let prepared = map::prepare(&file, base)?;
+    let mut old = 0u32;
+    unsafe { VirtualProtectEx(handle, base as *mut c_void, image_size as usize, 0x40, &mut old) };
+    let ok = unsafe {
+        WriteProcessMemory(
+            handle,
+            base as *mut c_void,
+            prepared.image.as_ptr() as *const c_void,
+            prepared.image.len(),
+            &mut written,
+        )
+    };
+    println!(
+        "hollow      wrote {written}/{} bytes (ok {ok}), region 0x{size:X}",
+        prepared.image.len()
+    );
+    if ok == 0 {
+        unsafe { CloseHandle(handle) };
+        return Err("hollow write failed".into());
+    }
+
+    let modules = modules_of(pid);
+    let parked = hijack(handle, pid, &modules, base + ping_rva as u64, base, stack_top - 8, park);
+    let Some(parked) = parked else {
+        unsafe { CloseHandle(handle) };
+        return Err("no thread available for the call".into());
+    };
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    unpark(handle, &parked);
+    println!("hollow      zeno_ping called, thread restored");
+
+    for step in 1..=12 {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
+        println!(
+            "hollow      t+{}s client {}",
+            step * 5,
+            if alive { "alive" } else { "DIED" }
+        );
+        if !alive {
+            break;
+        }
+    }
+
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+fn image_test(
+    pid: u32,
+    dll: &std::path::Path,
+    opts: ImageOpts,
+) -> Result<(), String> {
     let absolute = std::fs::canonicalize(dll).map_err(|e| format!("{}: {e}", dll.display()))?;
     let file = std::fs::read(dll).map_err(|e| format!("{}: {e}", dll.display()))?;
-    let ping_rva =
-        map::export_rva(&file, "zeno_ping").ok_or("zeno_ping export not found in payload")?;
+    let ping_rva = match map::export_rva(&file, "zeno_ping") {
+        Some(rva) => rva,
+        None if !opts.exec => 0,
+        None => return Err("zeno_ping export not found in payload".into()),
+    };
     println!("imagetest   zeno_ping rva 0x{ping_rva:X}");
 
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
@@ -1050,7 +1391,7 @@ fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result
     let mut failed: Vec<String> = Vec::new();
     let mut protected: Vec<u64> = Vec::new();
     let mapped = base as u64;
-    if load {
+    if opts.load {
         for import in map::import_table(&file)? {
         let library = wide(&import.library);
         let module = unsafe { GetModuleHandleW(library.as_ptr()) };
@@ -1117,7 +1458,7 @@ fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result
     };
     println!("imagetest   calling 0x{:X}", base as u64 + ping_rva as u64);
 
-    {
+    if opts.link {
         let pe = u32::from_le_bytes(file[0x3C..0x40].try_into().unwrap()) as usize;
         let entry_point =
             u32::from_le_bytes(file[pe + 24 + 16..pe + 24 + 20].try_into().unwrap());
@@ -1135,7 +1476,7 @@ fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result
     // Mapping-only mode: never touch a thread, just watch. This separates
     // "the view itself is detected" from "executing out of the view is
     // detected", which is the only open question left.
-    if !exec {
+    if !opts.exec {
         for step in 1..=12 {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let alive = unsafe { WaitForSingleObject(handle, 0) } != 0;
@@ -1228,7 +1569,7 @@ fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result
         unsafe { ResumeThread(thread) };
         println!(
             "imagetest   thread {id} (rank {rank}) sent into {}",
-            if load { "zeno_run" } else { "zeno_ping" }
+            if opts.load { "zeno_run" } else { "zeno_ping" }
         );
 
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1254,6 +1595,14 @@ fn image_test(pid: u32, dll: &std::path::Path, load: bool, exec: bool) -> Result
             CloseHandle(thread);
         }
         println!("imagetest   thread restored");
+
+        if opts.unmap {
+            let status = unsafe { NtUnmapViewOfSection(handle, base) };
+            println!(
+                "imagetest   unmap 0x{:X} -> 0x{:X}",
+                base as u64, status as u32
+            );
+        }
 
         for step in 1..=12 {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -1290,6 +1639,11 @@ fn main() -> Result<(), String> {
     let mut imagetest = false;
     let mut imageload = false;
     let mut imagehold = false;
+    let mut nolink = false;
+    let mut unmap = false;
+    let mut touch = 0u8; // 0 off, 1 open, 2 open+alloc, 3 open+alloc+write
+    let mut hollow = false;
+    let mut carrier: Option<String> = None;
     let mut mode: u64 = 1;
     let mut load: Option<PathBuf> = None;
     let mut config = PathBuf::from(
@@ -1317,6 +1671,15 @@ fn main() -> Result<(), String> {
             "--imagetest" => imagetest = true,
             "--imageload" => imageload = true,
             "--imagehold" => imagehold = true,
+            "--nolink" => nolink = true,
+            "--imageunmap" => unmap = true,
+            "--touch" => touch = 1,
+            "--touchalloc" => touch = 2,
+            "--touchwrite" => touch = 3,
+            "--hollow" => hollow = true,
+            "--carrier" => {
+                carrier = Some(argv.next().ok_or("--carrier needs a path")?);
+            }
             "--load" => load = Some(PathBuf::from(argv.next().ok_or("--load needs a path")?)),
             "--mode" => {
                 let value = argv.next().ok_or("--mode needs a number")?;
@@ -1341,10 +1704,30 @@ fn main() -> Result<(), String> {
         None => None,
     };
 
+    if hollow {
+        let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let dll = dll.as_ref().ok_or("--hollow needs --dll <payload.dll>")?;
+        return hollow_test(pid, dll, carrier.as_deref());
+    }
+
+    if touch != 0 {
+        let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return touch_test(pid, touch >= 2, touch >= 3);
+    }
+
     if imagetest || imageload || imagehold {
         let pid = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         let dll = dll.as_ref().ok_or("--imagetest/--imageload/--imagehold needs --dll <payload.dll>")?;
-        return image_test(pid, dll, imageload, !imagehold);
+        return image_test(
+            pid,
+            dll,
+            ImageOpts {
+                load: imageload,
+                exec: !imagehold,
+                link: !nolink,
+                unmap,
+            },
+        );
     }
 
     if libtest {
