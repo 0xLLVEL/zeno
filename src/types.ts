@@ -37,7 +37,7 @@ export interface Settings {
   autoExecute: boolean;
   consoleMaxLines: number;
   accent: string;
-  injectionMethod: "loadlibrary" | "manualmap" | "section";
+  injectionMethod: "loadlibrary" | "manualmap" | "section" | "apc";
 }
 
 export interface HubScript {

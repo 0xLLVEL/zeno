@@ -38,13 +38,18 @@ export function SettingsPanel() {
             value={settings.injectionMethod}
             onChange={(e) =>
               patchSettings({
-                injectionMethod: e.target.value as "loadlibrary" | "manualmap" | "section",
+                injectionMethod: e.target.value as
+                  | "loadlibrary"
+                  | "manualmap"
+                  | "section"
+                  | "apc",
               })
             }
           >
             <option value="loadlibrary">LoadLibrary (standard)</option>
             <option value="manualmap">Manual Map (stealth)</option>
             <option value="section">Section Image (file-backed)</option>
+            <option value="apc">APC Queue (no new thread)</option>
           </select>
         </label>
 

@@ -2,14 +2,16 @@
 
 //! Section-backed image mapping.
 //!
-//! Unlike `VirtualAllocEx` + `WriteProcessMemory`, this maps the payload as a
-//! real image section. The kernel applies base relocations and resolves the
-//! import table for us, and the resulting VAD entry is file-backed — so the
-//! allocation does not look like unbacked executable memory.
+//! The payload is mapped as a real image section: the kernel applies base
+//! relocations and resolves the import table, and the resulting VAD entry is
+//! file-backed, so it does not look like unbacked executable memory.
 //!
-//! What this does NOT defeat: handle filtering, thread-creation notification,
-//! image-load notification, or .text integrity checks. Those live in the
-//! kernel component and in the pre-initialisation window respectively.
+//! Every ntdll call goes through `crate::nt` (direct syscalls). If the SSN
+//! table cannot be recovered we fall back to resolved ntdll exports.
+//!
+//! Not covered: handle filtering, thread-creation notification, image-load
+//! notification, and `.text` integrity checks — those live in the kernel
+//! component and in the pre-initialisation window.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -23,68 +25,13 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-type NtStatus = i32;
-
-type NtCreateSectionFn = unsafe extern "system" fn(
-    *mut HANDLE,
-    u32,
-    *const core::ffi::c_void,
-    *const i64,
-    u32,
-    u32,
-    HANDLE,
-) -> NtStatus;
-
-type NtMapViewOfSectionFn = unsafe extern "system" fn(
-    HANDLE,
-    HANDLE,
-    *mut *mut core::ffi::c_void,
-    usize,
-    usize,
-    *const i64,
-    *mut usize,
-    u32,
-    u32,
-    u32,
-) -> NtStatus;
-
-type NtCreateThreadExFn = unsafe extern "system" fn(
-    *mut HANDLE,
-    u32,
-    *const core::ffi::c_void,
-    HANDLE,
-    *const core::ffi::c_void,
-    *const core::ffi::c_void,
-    u32,
-    usize,
-    usize,
-    usize,
-    *const core::ffi::c_void,
-) -> NtStatus;
-
-const SECTION_ALL_ACCESS: u32 = 0x000F_001F;
-const SEC_IMAGE: u32 = 0x0100_0000;
-const PAGE_READONLY: u32 = 0x02;
-const VIEW_UNMAP: u32 = 2;
-const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+use crate::nt;
 
 fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn ntdll_export(name: &[u8]) -> Result<usize, String> {
-    unsafe {
-        let ntdll = GetModuleHandleW(PCWSTR(wide("ntdll.dll").as_ptr()))
-            .map_err(|e| format!("ntdll: {e}"))?;
-        let mut full = name.to_vec();
-        full.push(0);
-        GetProcAddress(ntdll, PCSTR(full.as_ptr()))
-            .map(|f| std::mem::transmute::<_, usize>(f))
-            .ok_or_else(|| format!("missing ntdll export {}", String::from_utf8_lossy(name)))
-    }
-}
-
-fn entry_rva(dll: &Path) -> Result<(u32, u32), String> {
+pub(crate) fn entry_rva(dll: &Path) -> Result<u32, String> {
     let data = std::fs::read(dll).map_err(|e| format!("read payload: {e}"))?;
     if data.len() < 0x100 {
         return Err("payload too small".into());
@@ -103,34 +50,23 @@ fn entry_rva(dll: &Path) -> Result<(u32, u32), String> {
         return Err("bad PE signature".into());
     }
     let opt = lfanew + 24;
-    let magic = u16::from_le_bytes([data[opt], data[opt + 1]]);
-    if magic != 0x020B {
+    if u16::from_le_bytes([data[opt], data[opt + 1]]) != 0x020B {
         return Err("only x64 payloads supported".into());
     }
-    let entry = u32::from_le_bytes([
+    Ok(u32::from_le_bytes([
         data[opt + 16],
         data[opt + 17],
         data[opt + 18],
         data[opt + 19],
-    ]);
-    Ok((entry, 0))
+    ]))
 }
 
-pub fn map(pid: u32, dll: &Path) -> Result<(), String> {
-    let (entry, _) = entry_rva(dll)?;
+pub(crate) fn open_payload(dll: &Path) -> Result<HANDLE, String> {
     let path = dll.canonicalize().map_err(|e| format!("payload not found: {e}"))?;
-    let wide_path = wide(path.as_os_str());
-
-    let create_section: NtCreateSectionFn =
-        unsafe { std::mem::transmute(ntdll_export(b"NtCreateSection")?) };
-    let map_view: NtMapViewOfSectionFn =
-        unsafe { std::mem::transmute(ntdll_export(b"NtMapViewOfSection")?) };
-    let create_thread: NtCreateThreadExFn =
-        unsafe { std::mem::transmute(ntdll_export(b"NtCreateThreadEx")?) };
-
+    let name = wide(path.as_os_str());
     unsafe {
-        let file = CreateFileW(
-            PCWSTR(wide_path.as_ptr()),
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
             FILE_GENERIC_READ.0,
             FILE_SHARE_READ,
             None,
@@ -138,66 +74,147 @@ pub fn map(pid: u32, dll: &Path) -> Result<(), String> {
             FILE_ATTRIBUTE_NORMAL,
             None,
         )
-        .map_err(|e| format!("CreateFileW: {e}"))?;
+        .map_err(|e| format!("CreateFileW: {e}"))
+    }
+}
 
+pub fn map(pid: u32, dll: &Path) -> Result<(), String> {
+    let entry = entry_rva(dll)?;
+    let file = open_payload(dll)?;
+
+    if nt::available() {
+        let result = via_syscall(pid, file, entry);
+        unsafe {
+            let _ = CloseHandle(file);
+        }
+        result
+    } else {
+        let result = via_ntdll(pid, file, entry);
+        unsafe {
+            let _ = CloseHandle(file);
+        }
+        result
+    }
+}
+
+fn via_syscall(pid: u32, file: HANDLE, entry: u32) -> Result<(), String> {
+    if !crate::process::probe_write(pid) {
+        return Err("handle rejected — kernel filter (Hyperion) is active".into());
+    }
+
+    let section = nt::create_section(file.0 as usize, nt::PAGE_RO, nt::SEC_IMAGE)?;
+    let process = nt::open_process(pid, nt::PROCESS_ALL)?;
+
+    let result = (|| -> Result<(), String> {
+        let base = nt::map_view(process, section, nt::PAGE_RO)?;
+        let start = base + entry as usize;
+
+        let thread = nt::create_thread_ex(process, start, 1, 0)?;
+        let waited = unsafe { WaitForSingleObject(HANDLE(thread as *mut _), 6000) };
+        unsafe {
+            let _ = CloseHandle(HANDLE(thread as *mut _));
+        }
+        if waited != WAIT_OBJECT_0 {
+            return Err("DllMain thread timed out".into());
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        let _ = CloseHandle(HANDLE(section as *mut _));
+        let _ = CloseHandle(HANDLE(process as *mut _));
+    }
+    result
+}
+
+// ---------------------------------------------------------------- fallback
+
+type NtCreateSectionFn =
+    unsafe extern "system" fn(*mut HANDLE, u32, usize, usize, u32, u32, HANDLE) -> i32;
+type NtMapViewOfSectionFn =
+    unsafe extern "system" fn(HANDLE, HANDLE, *mut usize, usize, usize, usize, *mut usize, u32, u32, u32)
+        -> i32;
+type NtCreateThreadExFn = unsafe extern "system" fn(
+    *mut HANDLE,
+    u32,
+    usize,
+    HANDLE,
+    usize,
+    usize,
+    u32,
+    usize,
+    usize,
+    usize,
+    usize,
+) -> i32;
+
+fn ntdll_export(name: &[u8]) -> Result<usize, String> {
+    unsafe {
+        let ntdll = GetModuleHandleW(PCWSTR(wide("ntdll.dll").as_ptr()))
+            .map_err(|e| format!("ntdll: {e}"))?;
+        let mut full = name.to_vec();
+        full.push(0);
+        GetProcAddress(ntdll, PCSTR(full.as_ptr()))
+            .map(|f| std::mem::transmute::<_, usize>(f))
+            .ok_or_else(|| format!("missing ntdll export {}", String::from_utf8_lossy(name)))
+    }
+}
+
+fn via_ntdll(pid: u32, file: HANDLE, entry: u32) -> Result<(), String> {
+    let create_section: NtCreateSectionFn =
+        unsafe { std::mem::transmute(ntdll_export(b"NtCreateSection")?) };
+    let map_view: NtMapViewOfSectionFn =
+        unsafe { std::mem::transmute(ntdll_export(b"NtMapViewOfSection")?) };
+    let create_thread: NtCreateThreadExFn =
+        unsafe { std::mem::transmute(ntdll_export(b"NtCreateThreadEx")?) };
+
+    if !crate::process::probe_write(pid) {
+        return Err("handle rejected — kernel filter (Hyperion) is active".into());
+    }
+
+    unsafe {
         let mut section = HANDLE::default();
-        let status = create_section(
-            &mut section,
-            SECTION_ALL_ACCESS,
-            std::ptr::null(),
-            std::ptr::null(),
-            PAGE_READONLY,
-            SEC_IMAGE,
-            file,
-        );
-        let _ = CloseHandle(file);
+        let status = create_section(&mut section, nt::SECTION_ALL_ACCESS, 0, 0, nt::PAGE_RO, nt::SEC_IMAGE, file);
         if status < 0 {
             return Err(format!("NtCreateSection failed: {status:#x}"));
-        }
-
-        if !crate::process::probe_write(pid) {
-            let _ = CloseHandle(section);
-            return Err("handle rejected — kernel filter (Hyperion) is active".into());
         }
 
         let process = crate::process::open_for_injection(pid)
             .map_err(|e| format!("OpenProcess failed: {e}"))?;
 
-        let mut base: *mut core::ffi::c_void = std::ptr::null_mut();
-        let mut view_size: usize = 0;
+        let mut base = 0usize;
+        let mut view_size = 0usize;
         let status = map_view(
             section,
             process,
             &mut base,
             0,
             0,
-            std::ptr::null(),
-            &mut view_size,
-            VIEW_UNMAP,
             0,
-            PAGE_READONLY,
+            &mut view_size,
+            nt::VIEW_UNMAP,
+            0,
+            nt::PAGE_RO,
         );
         let _ = CloseHandle(section);
-        if status < 0 || base.is_null() {
+        if status < 0 || base == 0 {
             let _ = CloseHandle(process);
             return Err(format!("NtMapViewOfSection failed: {status:#x}"));
         }
 
-        let start = base as usize + entry as usize;
-
         let mut thread = HANDLE::default();
         let status = create_thread(
             &mut thread,
-            THREAD_ALL_ACCESS,
-            std::ptr::null(),
+            nt::THREAD_ALL,
+            0,
             process,
-            start as *const core::ffi::c_void,
-            1 as *const core::ffi::c_void, // DLL_PROCESS_ATTACH
+            base + entry as usize,
+            1,
             0,
             0,
             0,
             0,
-            std::ptr::null(),
+            0,
         );
         if status < 0 {
             let _ = CloseHandle(process);
@@ -207,7 +224,6 @@ pub fn map(pid: u32, dll: &Path) -> Result<(), String> {
         let waited = WaitForSingleObject(thread, 6000);
         let _ = CloseHandle(thread);
         let _ = CloseHandle(process);
-
         if waited != WAIT_OBJECT_0 {
             return Err("DllMain thread timed out".into());
         }

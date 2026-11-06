@@ -108,6 +108,8 @@ pub fn attach(state: State<'_, AppState>, pid: u32, method: String) -> Result<At
             "manual-map"
         } else if method.eq_ignore_ascii_case("section") {
             "section-image"
+        } else if method.eq_ignore_ascii_case("apc") {
+            "apc-queue"
         } else {
             "loadlibrary"
         };

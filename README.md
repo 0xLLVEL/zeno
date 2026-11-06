@@ -12,7 +12,7 @@ inside the client, named-pipe bridge between them.
 │  pipe server               │        │   ├─ prelude (task/Instance) │
 │   \\.\pipe\zeno_in ────────┼───────▶│   └─ pipe client             │
 │   \\.\pipe\zeno_out ◀──────┼────────│                              │
-│  injector (LL / manual map)│        │                              │
+│  injector (LL/map/section/APC)│    │                              │
 └────────────────────────────┘        └──────────────────────────────┘
 ```
 
@@ -72,13 +72,27 @@ npm run tauri:build
 - `section` (`src-tauri/src/section.rs`) — `NtCreateSection(SEC_IMAGE)` on the
   payload file, then `NtMapViewOfSection` into the target. The kernel applies
   relocations and resolves imports, and the mapping is **file-backed**, so it
-  does not trip unbacked-executable-memory scans. Thread creation goes through
-  `NtCreateThreadEx`. All three ntdll entry points are resolved at runtime, not
-  linked.
+  does not trip unbacked-executable-memory scans.
+- `apc` (`src-tauri/src/apc.rs`) — same section map, but no thread is created.
+  A 33-byte `DllMain(base, DLL_PROCESS_ATTACH, NULL)` stub is written into the
+  target and queued with `NtQueueApcThread` on up to 16 existing threads. Since
+  no thread is created, thread-creation notification never fires; the work runs
+  on a thread Roblox itself created. Cost: stub is one unbacked RWX region.
 
-`process::probe_write` runs before the section map and turns a denied write
-handle into an explicit error — that denial is what a kernel-level handle filter
-looks like from usermode.
+Every ntdll entry point used by `section` and `apc` goes through
+`src-tauri/src/nt.rs`, the direct-syscall layer:
+
+- SSNs are recovered at runtime from ntdll's own stubs (Hell's Gate:
+  `4C 8B D1 B8 <imm32>`), with a Halo's Gate walk over address-sorted neighbours
+  when a stub is hooked.
+- Each SSN becomes an 11-byte `mov r10, rcx / mov eax, ssn / syscall / ret`
+  trampoline in this process, so the call never enters a hooked ntdll prologue.
+- If a stub cannot be resolved, `section` falls back to resolved ntdll exports
+  and `apc` refuses rather than silently degrading.
+
+`process::probe_write` runs before every map and turns a denied write handle
+into an explicit error — that denial is what a kernel-level handle filter looks
+like from usermode.
 
 ## Anti-cheat scope
 
@@ -87,18 +101,19 @@ Be clear about what the injection layer does and does not cover:
 | vector | covered |
 |---|---|
 | unbacked executable memory | yes, by `section` |
-| remote module list (LoadLibrary) | yes, by `manualmap` / `section` |
-| ntdll hook on thread creation | partially — dynamic resolution, no direct syscalls yet |
+| remote module list (LoadLibrary) | yes, by `manualmap` / `section` / `apc` |
+| ntdll hooks on NT calls | yes, by `nt` direct syscalls |
+| thread-creation notification (kernel) | yes, by `apc` — no thread is created |
 | handle filtering (kernel) | **no** — needs a driver or a signed loader |
-| thread-creation notification (kernel) | **no** |
-| image-load notification (kernel) | **no** |
+| image-load notification (kernel) | partially — section maps are real image views |
 | `.text` integrity checks | **no** |
 
-Hyperion (Byfron) on the Windows client ships a kernel component that enforces
-the last four. Usermode-only injection does not get past it; the practical
-routes are a signed vulnerable driver, or injecting inside the window before
-Hyperion initialises. Everything above that — the bridge, the Luau runtime, the
-scheduler — is unaffected and works as soon as injection succeeds.
+Hyperion (Byfron) on the Windows client ships a kernel component that owns
+handle filtering and `.text` page integrity. Usermode-only injection does not
+get past those two; the practical routes are a signed vulnerable driver, or
+injecting inside the window before Hyperion initialises. Everything above that
+— the bridge, the Luau runtime, the scheduler — is unaffected and works as soon
+as injection succeeds.
 
 ## Bridge
 

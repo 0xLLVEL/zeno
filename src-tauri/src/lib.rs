@@ -1,9 +1,13 @@
 mod commands;
 
 #[cfg(windows)]
+mod apc;
+#[cfg(windows)]
 mod injector;
 #[cfg(windows)]
 mod manualmap;
+#[cfg(windows)]
+mod nt;
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
