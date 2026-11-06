@@ -242,7 +242,24 @@ fn modules_of(pid: u32) -> Vec<Module> {
             }
         }
         if base != 0 && size != 0 {
-            out.push(Module { name, base, size });
+            // The loader entry for this client reports a base that is a few
+            // allocation granules below where the PE header actually sits, so
+            // trust the header, not the arithmetic.
+            let mut image = base;
+            if read_u16_at(handle, image) != Some(0x5A4D) {
+                for step in 1..16u64 {
+                    let candidate = base + step * 0x10000;
+                    if read_u16_at(handle, candidate) == Some(0x5A4D) {
+                        image = candidate;
+                        break;
+                    }
+                }
+            }
+            out.push(Module {
+                name,
+                base: image,
+                size,
+            });
         }
         link = read_u64(handle, link);
     }
@@ -1863,8 +1880,8 @@ fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), Strin
             let ok = unsafe { GetThreadContext(*thread, context.as_mut_ptr() as *mut c_void) } != 0;
             let rip = unsafe { *(context.as_ptr().add(0xF8) as *const u64) };
             // CONTEXT layout: RAX 0x78, RCX 0x80, RDX 0x88, RBX 0x90.
-            // luaD_call moves RCX into RBX at +0x0D, so past that point the
-            // state lives in RBX and RCX is scratch.
+            // luaD_call copies RCX into RBX at +0x20, so after that the state
+            // lives in RBX and RCX is scratch. Before it, RCX is the state.
             let rcx = unsafe { *(context.as_ptr().add(0x80) as *const u64) };
             let rbx = unsafe { *(context.as_ptr().add(0x90) as *const u64) };
             unsafe { ResumeThread(*thread) };
@@ -1873,11 +1890,58 @@ fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), Strin
             }
             spins += 1;
             if rip >= entry && rip < entry + span {
-                let state = if rip >= entry + 0x0D { rbx } else { rcx };
+                // luaV_execute keeps `L` in r12 (mov r12, rcx at +0x20), so r12
+                // is the reliable carrier anywhere in the interpreter body.
+                let mut registers = [0u64; 16];
+                let slots = [
+                    0x78usize, 0x80, 0x88, 0x90, 0xB0, 0xA8, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0,
+                    0xE8, 0xF0, 0x98, 0xA0,
+                ];
+                for (index, slot) in slots.iter().enumerate() {
+                    registers[index] = unsafe { *(context.as_ptr().add(*slot) as *const u64) };
+                }
+                let r12 = registers[10];
+                let mut state = 0u64;
+                // `lea rsi, [r12 + 0x70]` right in the interpreter prologue
+                // proves r12 is the state; its header tag byte is 0x0A in this
+                // build, not the Luau textbook 8, so tag alone is not a test.
+                let r12_stack = read_u64(handle, r12 + LUA_U64_STACK);
+                let r12_top = read_u64(handle, r12 + LUA_U64_TOP);
+                let r12_last = read_u64(handle, r12 + LUA_U64_STACK_LAST);
+                if r12_stack > 0x10000 && r12_stack <= r12_top && r12_top <= r12_last {
+                    state = r12;
+                }
+                if state == 0 {
+                    for candidate in registers {
+                        let stack = read_u64(handle, candidate + LUA_U64_STACK);
+                        let top = read_u64(handle, candidate + LUA_U64_TOP);
+                        let last = read_u64(handle, candidate + LUA_U64_STACK_LAST);
+                        let global = read_u64(handle, candidate + LUA_U64_GLOBAL);
+                        if stack > 0x10000 && stack <= top && top <= last && global > 0x10000 {
+                            state = candidate;
+                            break;
+                        }
+                    }
+                }
                 println!(
-                    "sampler     hit thread {id} rip 0x{rip:X} (+0x{:X}) state 0x{state:X} (rcx 0x{rcx:X} rbx 0x{rbx:X}) after {spins} spins",
+                    "sampler     hit thread {id} rip 0x{rip:X} (+0x{:X}) state 0x{state:X} after {spins} spins",
                     rip - entry
                 );
+                println!(
+                    "sampler     rax 0x{:X} rcx 0x{:X} rdx 0x{:X} rbx 0x{:X} rsi 0x{:X} rdi 0x{:X} r8 0x{:X} r9 0x{:X}",
+                    registers[0], registers[1], registers[2], registers[3],
+                    registers[5], registers[4], registers[6], registers[7]
+                );
+                println!(
+                    "sampler     r10 0x{:X} r11 0x{:X} r12 0x{:X} r13 0x{:X} r14 0x{:X} r15 0x{:X} rsp 0x{:X} rbp 0x{:X}",
+                    registers[8], registers[9], registers[10], registers[11],
+                    registers[12], registers[13], registers[14], registers[15]
+                );
+                if state == 0 {
+                    println!("sampler     no register carried a lua_State; r12 0x{r12:X} contents:");
+                    dump_in(handle, r12, 0x40);
+                    continue;
+                }
                 describe_state(handle, &modules, state);
                 println!("sampler     raw state:");
                 dump_in(handle, state, 0x100);
@@ -2000,6 +2064,10 @@ fn read_bytes(handle: Handle, address: u64, length: usize) -> Option<Vec<u8>> {
 
 fn read_u8_at(handle: Handle, address: u64) -> Option<u8> {
     read_bytes(handle, address, 1).map(|bytes| bytes[0])
+}
+
+fn read_u16_at(handle: Handle, address: u64) -> Option<u16> {
+    read_bytes(handle, address, 2).map(|bytes| u16::from_le_bytes(bytes[..2].try_into().unwrap()))
 }
 
 fn read_u32_at(handle: Handle, address: u64) -> Option<u32> {
@@ -2188,27 +2256,116 @@ fn vm_info(pid: u32, state: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Calls one client function once from a hijacked thread and puts the thread
-/// back exactly where it was.
+/// One call in a chain. `prepare` runs with the target thread suspended and
+/// returns the four Win64 argument registers, or `None` to abort and restore.
+struct Step {
+    label: &'static str,
+    rva: u64,
+    absolute: bool,
+    prepare: Box<dyn FnMut(Handle) -> Option<[u64; 4]>>,
+}
+
+fn write_bytes_at(handle: Handle, address: u64, data: &[u8]) -> bool {
+    let mut written = 0usize;
+    let ok = unsafe {
+        WriteProcessMemory(
+            handle,
+            address as *mut c_void,
+            data.as_ptr() as *const c_void,
+            data.len(),
+            &mut written,
+        )
+    };
+    ok != 0 && written == data.len()
+}
+
+fn write_u64_at(handle: Handle, address: u64, value: u64) -> bool {
+    write_bytes_at(handle, address, &value.to_le_bytes())
+}
+
+/// A stack slot in this VM is a plain 16-byte `TValue`: value at +0, `extra` at
+/// +8, type tag at +0xC. Nothing in the tag or the value is VMValue-encoded.
+fn write_tvalue(handle: Handle, address: u64, value: u64, tag: i32) -> bool {
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&value.to_le_bytes());
+    raw[12..].copy_from_slice(&(tag as u32).to_le_bytes());
+    write_bytes_at(handle, address, &raw)
+}
+
+fn read_tstring(handle: Handle, string: u64) -> String {
+    if string < 0x10000 {
+        return String::new();
+    }
+    let len = read_u32_at(handle, string + 0x14).unwrap_or(0) as usize;
+    let len = len.min(4096);
+    match read_bytes(handle, string + 0x18, len) {
+        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// Walks a thread forward until it lands on the `EB FE` pad, leaving it
+/// suspended there so the next step can arm the same thread again.
+fn wait_for_park(
+    thread: Handle,
+    target: u64,
+    park: u64,
+    stack_top: u64,
+    wait_ms: u64,
+) -> Option<[u64; 4]> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let mut last = (0u64, 0u64);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        unsafe { SuspendThread(thread) };
+        let mut probe = vec![0u8; CONTEXT_SIZE];
+        unsafe { *(probe.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+        let ok = unsafe { GetThreadContext(thread, probe.as_mut_ptr() as *mut c_void) } != 0;
+        if ok {
+            let rip = unsafe { *(probe.as_ptr().add(0xF8) as *const u64) };
+            let rsp = unsafe { *(probe.as_ptr().add(0x98) as *const u64) };
+            let rax = unsafe { *(probe.as_ptr().add(0x78) as *const u64) };
+            last = (rip, rsp);
+            if rip == park && rsp == stack_top {
+                return Some([rax, 0, 0, 0]);
+            }
+        }
+        unsafe { ResumeThread(thread) };
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "run         gave up: last rip 0x{:X} (target+0x{:X}) rsp 0x{:X} (stack_top 0x{stack_top:X})",
+                last.0,
+                last.0.wrapping_sub(target),
+                last.1
+            );
+            return None;
+        }
+    }
+}
+
+/// Runs one or more client functions back to back on a hijacked thread.
 ///
-/// Only data is written: a scratch stack plus four register values. No code
-/// bytes are touched and no new executable region appears, which is the only
-/// shape that has survived the client's integrity watch so far. The return
-/// address lands on an `EB FE` pad, so the thread parks in a spin instead of
-/// running off the end of the scratch stack.
-fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Result<u64, String> {
+/// Only data is written: a scratch stack plus register values. No code bytes
+/// are touched and no new executable region appears, which is the only shape
+/// that has survived the client's integrity watch so far. Each call returns
+/// onto an `EB FE` pad inside the client's own `.text`, so the thread spins
+/// with its stack pointer parked at `stack_top` until the next step is armed.
+/// The original context goes back only after the last step.
+fn remote_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
     }
     let modules = modules_of(pid);
-    let Some(client) = modules.iter().find(|module| module.name.eq_ignore_ascii_case(EXE))
+    let Some(client) = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
     else {
         unsafe { CloseHandle(handle) };
         return Err("client module not found".into());
     };
-    let target = client.base + target_rva;
-    let park = client.base + PARK_RVA;
+    let client_base = client.base;
+    let park = client_base + PARK_RVA;
     match read_bytes(handle, park, 2) {
         Some(bytes) if bytes == [0xEB, 0xFE] => {}
         other => {
@@ -2217,33 +2374,43 @@ fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Resul
         }
     }
 
-    let scratch = unsafe {
-        VirtualAllocEx(handle, std::ptr::null_mut(), 0x2000, MEM_COMMIT_RESERVE, 0x04)
-    };
+    let scratch =
+        unsafe { VirtualAllocEx(handle, std::ptr::null_mut(), 0x2000, MEM_COMMIT_RESERVE, 0x04) };
     if scratch.is_null() {
         unsafe { CloseHandle(handle) };
         return Err("scratch allocation failed".into());
     }
     let stack_top = scratch as u64 + 0x2000 - 0x10;
-    let mut written = 0usize;
-    unsafe {
-        WriteProcessMemory(
-            handle,
-            (stack_top - 8) as *mut c_void,
-            &park as *const u64 as *const c_void,
-            8,
-            &mut written,
-        )
-    };
+    if !write_u64_at(handle, stack_top - 8, park) {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err("scratch write failed".into());
+    }
     println!(
-        "xcall       target {} (rva 0x{target_rva:X}) park {} scratch 0x{:X}",
-        module_hit(&modules, target),
+        "run         scratch 0x{:X} park {} target {}",
+        scratch as u64,
         module_hit(&modules, park),
-        scratch as u64
+        steps
+            .iter()
+            .map(|step| {
+                let target = if step.absolute {
+                    step.rva
+                } else {
+                    client_base + step.rva
+                };
+                format!("{}={}", step.label, module_hit(&modules, target))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     println!(
-        "xcall       rcx 0x{:X} rdx 0x{:X} r8 0x{:X} r9 0x{:X}",
-        args[0], args[1], args[2], args[3]
+        "run         base 0x{client_base:X} park_abs 0x{park:X} first_target_abs 0x{:X}",
+        match steps.first() {
+            Some(step) if step.absolute => step.rva,
+            Some(step) => client_base + step.rva,
+            None => 0,
+        }
     );
 
     let mut ordered: Vec<(u8, u32)> = threads_of(pid)
@@ -2260,20 +2427,24 @@ fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Resul
         .collect();
     ordered.sort_by_key(|entry| entry.0);
 
-    let mut chosen: Option<(u32, Handle, Vec<u8>)> = None;
-    for (rank, id) in ordered {
-        if rank > 2 {
-            break;
-        }
+    let candidates: Vec<u32> = ordered
+        .iter()
+        .filter(|(rank, _)| *rank <= 2)
+        .map(|(_, id)| *id)
+        .collect();
+    println!("run         {} candidate threads", candidates.len());
+
+    let mut last_error = String::from("no thread available");
+    let mut done = false;
+
+    for id in candidates {
         let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
         if thread.is_null() {
             continue;
         }
         unsafe { SuspendThread(thread) };
         let mut original = vec![0u8; CONTEXT_SIZE];
-        unsafe {
-            *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
-        }
+        unsafe { *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
         if unsafe { GetThreadContext(thread, original.as_mut_ptr() as *mut c_void) } == 0 {
             unsafe {
                 ResumeThread(thread);
@@ -2281,77 +2452,288 @@ fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Resul
             };
             continue;
         }
-        let mut patched = original.clone();
-        unsafe {
-            // CONTEXT layout: RAX 0x78, RCX 0x80, RDX 0x88, RBX 0x90, RSP 0x98,
-            // R8 0xB8, R9 0xC0, RIP 0xF8. RBX stays untouched so nothing that
-            // peeks at it before writing sees a foreign pointer.
-            *(patched.as_mut_ptr().add(0xF8) as *mut u64) = target;
-            *(patched.as_mut_ptr().add(0x98) as *mut u64) = stack_top - 8;
-            *(patched.as_mut_ptr().add(0x78) as *mut u64) = 0;
-            *(patched.as_mut_ptr().add(0x80) as *mut u64) = args[0];
-            *(patched.as_mut_ptr().add(0x88) as *mut u64) = args[1];
-            *(patched.as_mut_ptr().add(0xB8) as *mut u64) = args[2];
-            *(patched.as_mut_ptr().add(0xC0) as *mut u64) = args[3];
-        }
-        if unsafe { SetThreadContext(thread, patched.as_ptr() as *const c_void) } == 0 {
+        // Run the call on the thread's own stack. A scratch allocation puts
+        // RSP outside every stack range the client knows about, and that is
+        // fatal here. The bytes below the thread's current RSP are unused by
+        // its live frames, so they are safe to borrow.
+        let original_rsp = unsafe { *(original.as_ptr().add(0x98) as *const u64) };
+        let resume_rsp = (original_rsp - 0x800) & !0xF;
+        let expected_rsp = resume_rsp + 8;
+        if !write_u64_at(handle, resume_rsp, park) {
             unsafe {
                 ResumeThread(thread);
                 CloseHandle(thread);
             };
             continue;
         }
-        unsafe { ResumeThread(thread) };
-        chosen = Some((id, thread, original));
-        break;
+        let mut context = original.clone();
+        let mut armed = false;
+        let mut failure: Option<String> = None;
+
+        for (index, step) in steps.iter_mut().enumerate() {
+            let Some(args) = (step.prepare)(handle) else {
+                failure = Some(format!("{} aborted in prepare", step.label));
+                break;
+            };
+            let target = if step.absolute {
+                step.rva
+            } else {
+                client_base + step.rva
+            };
+            arm_context(&mut context, target, resume_rsp, args);
+            if unsafe { SetThreadContext(thread, context.as_ptr() as *const c_void) } == 0 {
+                failure = Some(format!("{}: SetThreadContext failed", step.label));
+                break;
+            }
+            unsafe { ResumeThread(thread) };
+            armed = true;
+            if index == 0 && !thread_started(thread, target) {
+                failure = Some("frozen, never executed a single instruction".to_string());
+                break;
+            }
+            match wait_for_park(thread, target, park, expected_rsp, wait_ms) {
+                Some(registers) => {
+                    println!(
+                        "run         {} parked, rax 0x{:X} ({})",
+                        step.label,
+                        registers[0],
+                        module_hit(&modules, registers[0])
+                    );
+                }
+                None => {
+                    failure = Some(format!("{} never reached the park pad", step.label));
+                    break;
+                }
+            }
+            let mut current = vec![0u8; CONTEXT_SIZE];
+            unsafe { *(current.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+            if unsafe { GetThreadContext(thread, current.as_mut_ptr() as *mut c_void) } != 0 {
+                context = current;
+            }
+        }
+
+        if armed {
+            unsafe {
+                SuspendThread(thread);
+                SetThreadContext(thread, original.as_ptr() as *const c_void);
+                ResumeThread(thread);
+            }
+        } else {
+            unsafe { ResumeThread(thread) };
+        }
+
+        match failure {
+            None => {
+                println!("run         thread {id} restored");
+                unsafe { CloseHandle(thread) };
+                done = true;
+                break;
+            }
+            Some(message) => {
+                println!("run         thread {id}: {message}");
+                last_error = message;
+                unsafe { CloseHandle(thread) };
+            }
+        }
     }
 
-    let Some((id, thread, original)) = chosen else {
-        unsafe { CloseHandle(handle) };
-        return Err("no thread available".into());
-    };
-    println!("xcall       thread {id} dispatched");
+    unsafe { CloseHandle(handle) };
+    if done {
+        Ok(park)
+    } else {
+        Err(last_error)
+    }
+}
 
-    // Poll for the park pad. RSP is the tell: the callee pushed a frame, so a
-    // thread still inside it sits below `stack_top`.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-    let mut parked = false;
-    while std::time::Instant::now() < deadline {
+/// Writes the four argument registers plus RIP/RSP into a saved CONTEXT.
+/// RAX is cleared and RBX left alone so nothing that peeks at them before
+/// writing sees a foreign pointer.
+fn arm_context(context: &mut [u8], target: u64, rsp: u64, args: [u64; 4]) {
+    unsafe {
+        *(context.as_mut_ptr().add(0xF8) as *mut u64) = target;
+        *(context.as_mut_ptr().add(0x98) as *mut u64) = rsp;
+        *(context.as_mut_ptr().add(0x78) as *mut u64) = 0;
+        *(context.as_mut_ptr().add(0x80) as *mut u64) = args[0];
+        *(context.as_mut_ptr().add(0x88) as *mut u64) = args[1];
+        *(context.as_mut_ptr().add(0xB8) as *mut u64) = args[2];
+        *(context.as_mut_ptr().add(0xC0) as *mut u64) = args[3];
+    }
+}
+
+/// Checks whether an armed thread actually executes. Some threads in this
+/// client are parked by the anti-tamper logic and never run our context at all,
+/// which is indistinguishable from a hang unless the instruction pointer is
+/// watched from the very first moment.
+fn thread_started(thread: Handle, entry: u64) -> bool {
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
         unsafe { SuspendThread(thread) };
         let mut probe = vec![0u8; CONTEXT_SIZE];
-        unsafe {
-            *(probe.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
-        }
+        unsafe { *(probe.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
         let ok = unsafe { GetThreadContext(thread, probe.as_mut_ptr() as *mut c_void) } != 0;
         let rip = unsafe { *(probe.as_ptr().add(0xF8) as *const u64) };
-        let rsp = unsafe { *(probe.as_ptr().add(0x98) as *const u64) };
-        let rax = unsafe { *(probe.as_ptr().add(0x78) as *const u64) };
         unsafe { ResumeThread(thread) };
-        if ok && rip == park && rsp == stack_top {
-            parked = true;
-            println!("xcall       parked, rax 0x{rax:X} ({})", module_hit(&modules, rax));
-            break;
+        if ok && rip != entry {
+            return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    false
+}
+
+fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Result<u64, String> {
+    remote_run(
+        pid,
+        vec![Step {
+            label: "xcall",
+            rva: target_rva,
+            absolute: target_rva >= 0x7FF0_0000_0000,
+            prepare: Box::new(move |_handle| Some(args)),
+        }],
+        wait_ms,
+    )
+}
+
+const LUA_D_CALL_RVA: u64 = 0x26361C0;
+const LUA_LOAD_RVA: u64 = 0x426A570;
+
+/// Loads a script with the client's own `luau_load` and runs it through the
+/// client's own `pcall` closure, so a script error unwinds through Roblox's
+/// handler instead of escaping into the hijacked thread.
+fn lua_exec(pid: u32, state: u64, script: &std::path::Path) -> Result<(), String> {
+    let source = std::fs::read(script).map_err(|e| format!("{}: {e}", script.display()))?;
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
     }
 
-    if !parked {
-        unsafe {
-            CloseHandle(thread);
-            CloseHandle(handle);
-        }
-        return Err("thread never reached the park pad; left it untouched".into());
+    // LuaVMLoad(L, const std::string* source, const char* chunkname, int env)
+    //   rdx is an MSVC std::string: buffer pointer at +0x0, size at +0x10,
+    //   capacity at +0x18, inline buffer 16 bytes when capacity is 15.
+    //   Capacity is forced above 15 so the client reads through `[obj+0]`,
+    //   which is the branch it takes for anything longer than SSO.
+    let source_size = source.len();
+    let source_capacity = source_size.max(15) + 1;
+    let chunkname = b"=zeno\0";
+
+    let string_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    let buffer_slot = unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            source_size + 1,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    let name_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    if string_slot.is_null() || buffer_slot.is_null() || name_slot.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("argument allocation failed".into());
     }
 
-    unsafe {
-        SuspendThread(thread);
-        SetThreadContext(thread, original.as_ptr() as *const c_void);
-        ResumeThread(thread);
-        CloseHandle(thread);
-        CloseHandle(handle);
+    let mut descriptor = vec![0u8; 0x20];
+    descriptor[0x0..0x8].copy_from_slice(&(buffer_slot as u64).to_le_bytes());
+    descriptor[0x10..0x18].copy_from_slice(&(source_size as u64).to_le_bytes());
+    descriptor[0x18..0x20].copy_from_slice(&(source_capacity as u64).to_le_bytes());
+
+    let string_ok = write_bytes_at(handle, string_slot as u64, &descriptor);
+    let buffer_ok = write_bytes_at(handle, buffer_slot as u64, &source);
+    let name_ok = write_bytes_at(handle, name_slot as u64, chunkname);
+    unsafe { CloseHandle(handle) };
+    if !string_ok || !buffer_ok || !name_ok {
+        return Err("argument write failed".into());
     }
-    println!("xcall       thread {id} restored");
-    Ok(park)
+    println!(
+        "exec        staged string 0x{:X} -> buffer 0x{:X} ({source_size} bytes, cap {source_capacity}) name 0x{:X}",
+        string_slot as u64, buffer_slot as u64, name_slot as u64
+    );
+
+    let slot = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let load_slot = slot.clone();
+
+    let mut steps: Vec<Step> = Vec::new();
+    steps.push(Step {
+        label: "luau_load",
+        rva: LUA_LOAD_RVA,
+        absolute: false,
+        prepare: Box::new(move |_handle| {
+            Some([state, string_slot as u64, name_slot as u64, 0])
+        }),
+    });
+    steps.push(Step {
+        label: "luaD_call",
+        rva: LUA_D_CALL_RVA,
+        absolute: false,
+        prepare: Box::new(move |handle| {
+            let top = read_u64_checked(handle, state + LUA_U64_TOP)?;
+            if top < 32 {
+                println!("exec        top 0x{top:X} is implausible");
+                return None;
+            }
+            let function_slot = top - 16;
+            let value = read_u64(handle, function_slot);
+            let tag = read_i32_at(handle, function_slot + TVAL_I32_TT).unwrap_or(-1);
+            let global = read_u64(handle, state + LUA_U64_GLOBAL);
+            let pcall = read_u64(handle, global + G_U64_BUILTIN_PCALL);
+            println!(
+                "exec        load left top 0x{top:X}, slot 0x{function_slot:X}, tag {tag}, value 0x{value:X}, pcall 0x{pcall:X}"
+            );
+            if tag == 4 {
+                println!("exec        compile error: {}", read_tstring(handle, value));
+                return None;
+            }
+            if tag != LUA_TFUNCTION || pcall == 0 {
+                return None;
+            }
+            if !write_tvalue(handle, function_slot, pcall, LUA_TFUNCTION) {
+                return None;
+            }
+            if !write_tvalue(handle, function_slot + 16, value, LUA_TFUNCTION) {
+                return None;
+            }
+            if !write_u64_at(handle, state + LUA_U64_TOP, function_slot + 32) {
+                return None;
+            }
+            load_slot.set(function_slot);
+            Some([state, function_slot, u64::MAX, 0])
+        }),
+    });
+
+    let outcome = remote_run(pid, steps, 20000);
+    let base = slot.get();
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if !handle.is_null() && handle != -1isize as Handle && base != 0 {
+        let top = read_u64(handle, state + LUA_U64_TOP);
+        println!("exec        returned, top 0x{top:X} from 0x{base:X}");
+        let mut cursor = base;
+        let mut index = 0;
+        while cursor + 16 <= top && index < 16 {
+            let value = read_u64(handle, cursor);
+            let tag = read_i32_at(handle, cursor + TVAL_I32_TT).unwrap_or(-1);
+            let rendered = match tag {
+                0 => "nil".to_string(),
+                1 => format!("boolean {}", value != 0),
+                3 => format!("number {}", f64::from_bits(value)),
+                4 => format!("string {:?}", read_tstring(handle, value)),
+                5 => format!("table 0x{value:X}"),
+                6 => format!("function 0x{value:X}"),
+                8 => format!("thread 0x{value:X}"),
+                other => format!("tag {other} value 0x{value:X}"),
+            };
+            println!("exec        result[{index}] {rendered}");
+            cursor += 16;
+            index += 1;
+        }
+        // The host thread was suspended with its own top; put it back.
+        write_u64_at(handle, state + LUA_U64_TOP, base);
+        unsafe { CloseHandle(handle) };
+    }
+    outcome.map(|_| ())
 }
 
 fn image_test(
@@ -2704,6 +3086,7 @@ fn main() -> Result<(), String> {
     let mut dump: Option<(u32, u64, usize)> = None;
     let mut vminfo: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
+    let mut execute: Option<(u64, PathBuf)> = None;
     let mut carrier: Option<String> = None;
     let mut use_existing = false;
     let mut mode: u64 = 1;
@@ -2794,8 +3177,25 @@ fn main() -> Result<(), String> {
             }
             "--xcall" => {
                 let value = argv.next().ok_or("--xcall needs an rva")?;
-                let rva = u64::from_str_radix(value.trim_start_matches("0x"), 16)
-                    .map_err(|_| format!("bad rva {value}"))?;
+                let rva = if let Some(symbol) = value.strip_prefix("@") {
+                    // System DLLs are mapped at the same address in every
+                    // process on this boot, so a local lookup is valid.
+                    let (module, export) = symbol
+                        .split_once('!')
+                        .ok_or_else(|| format!("bad symbol {symbol}"))?;
+                    let base = unsafe { GetModuleHandleW(wide(module).as_ptr()) };
+                    if base.is_null() {
+                        return Err(format!("{module} is not loaded here"));
+                    }
+                    let address = unsafe { GetProcAddress(base, export.as_ptr()) };
+                    if address.is_null() {
+                        return Err(format!("{symbol} not found"));
+                    }
+                    address as u64
+                } else {
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad rva {value}"))?
+                };
                 let mut call_args = [0u64; 4];
                 for slot in call_args.iter_mut() {
                     let text = argv.next().ok_or("--xcall needs four hex arguments")?;
@@ -2809,6 +3209,13 @@ fn main() -> Result<(), String> {
                     None => 8000,
                 };
                 xcall = Some((rva, call_args, wait_ms));
+            }
+            "--exec" => {
+                let value = argv.next().ok_or("--exec needs a lua_State address")?;
+                let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let script = PathBuf::from(argv.next().ok_or("--exec needs a script path")?);
+                execute = Some((state, script));
             }
             "--oracle" => {                oracle_pid = Some(match pid {
                     Some(value) => value,
@@ -2870,6 +3277,11 @@ fn main() -> Result<(), String> {
         let park = remote_call(target, rva, call_args, wait_ms)?;
         println!("xcall       done, park pad 0x{park:X}");
         return Ok(());
+    }
+
+    if let Some((state, script)) = execute {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return lua_exec(target, state, &script);
     }
 
     if let Some((target, address, length)) = dump {
