@@ -192,6 +192,7 @@ macro_rules! nt {
     };
 }
 
+type Fn2 = unsafe extern "system" fn(usize, usize) -> NtStatus;
 type Fn4 = unsafe extern "system" fn(usize, u32, usize, usize) -> NtStatus;
 type Fn5 = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> NtStatus;
 type Fn6 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> NtStatus;
@@ -206,6 +207,17 @@ type Fn11 = unsafe extern "system" fn(
 pub const PROCESS_ALL: u32 = 0x1F_FFFF;
 
 pub const THREAD_ALL: u32 = 0x1F_FFFF;
+
+pub const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+pub const THREAD_GET_CONTEXT: u32 = 0x0008;
+pub const THREAD_SET_CONTEXT: u32 = 0x0010;
+pub const THREAD_QUERY_LIMITED: u32 = 0x0800;
+
+/// Size of AMD64 `CONTEXT`; `Rip` sits at 0xF8 and `ContextFlags` at 0x30.
+pub const CONTEXT_SIZE: usize = 1232;
+pub const CONTEXT_OFFSET_FLAGS: usize = 0x30;
+pub const CONTEXT_OFFSET_RIP: usize = 0xF8;
+pub const CONTEXT_AMD64_FULL: u32 = 0x0010_000B;
 
 pub const SECTION_ALL_ACCESS: u32 = 0x000F_001F;
 pub const SEC_IMAGE: u32 = 0x0100_0000;
@@ -423,4 +435,107 @@ pub fn queue_apc(thread: usize, routine: usize, argument: usize) -> Result<(), S
         return Err(format!("NtQueueApcThread failed ({status:#x})"));
     }
     Ok(())
+}
+
+pub fn open_thread(tid: u32, access: u32) -> Result<usize, String> {
+    let Some(addr) = nt!("NtOpenThread") else {
+        return Err("NtOpenThread SSN unresolved".into());
+    };
+    let f: Fn4 = unsafe { std::mem::transmute(addr) };
+
+    let mut handle = 0usize;
+    let attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root: 0,
+        name: std::ptr::null_mut(),
+        attributes: 0,
+        security: 0,
+        security_quality_of_service: 0,
+    };
+    let client = ClientId {
+        unique_process: 0,
+        unique_thread: tid as usize,
+    };
+
+    let status = unsafe {
+        f(
+            &mut handle as *mut usize as usize,
+            access,
+            &attributes as *const ObjectAttributes as usize,
+            &client as *const ClientId as usize,
+        )
+    };
+    if status < 0 || handle == 0 {
+        return Err(format!(
+            "NtOpenThread denied ({status:#x}) — thread access filter active"
+        ));
+    }
+    Ok(handle)
+}
+
+pub fn suspend_thread(handle: usize) -> Result<u32, String> {
+    let Some(addr) = nt!("NtSuspendThread") else {
+        return Err("NtSuspendThread SSN unresolved".into());
+    };
+    let f: Fn2 = unsafe { std::mem::transmute(addr) };
+
+    let mut previous = 0u32;
+    let status = unsafe { f(handle, &mut previous as *mut u32 as usize) };
+    if status < 0 {
+        return Err(format!("NtSuspendThread failed ({status:#x})"));
+    }
+    Ok(previous)
+}
+
+pub fn resume_thread(handle: usize) -> Result<u32, String> {
+    let Some(addr) = nt!("NtResumeThread") else {
+        return Err("NtResumeThread SSN unresolved".into());
+    };
+    let f: Fn2 = unsafe { std::mem::transmute(addr) };
+
+    let mut previous = 0u32;
+    let status = unsafe { f(handle, &mut previous as *mut u32 as usize) };
+    if status < 0 {
+        return Err(format!("NtResumeThread failed ({status:#x})"));
+    }
+    Ok(previous)
+}
+
+pub fn get_thread_context(handle: usize, context: &mut [u8; CONTEXT_SIZE]) -> Result<(), String> {
+    let Some(addr) = nt!("NtGetContextThread") else {
+        return Err("NtGetContextThread SSN unresolved".into());
+    };
+    let f: Fn2 = unsafe { std::mem::transmute(addr) };
+
+    context[CONTEXT_OFFSET_FLAGS..CONTEXT_OFFSET_FLAGS + 4]
+        .copy_from_slice(&CONTEXT_AMD64_FULL.to_le_bytes());
+
+    let status = unsafe { f(handle, context.as_mut_ptr() as usize) };
+    if status < 0 {
+        return Err(format!("NtGetContextThread failed ({status:#x})"));
+    }
+    Ok(())
+}
+
+pub fn set_thread_context(handle: usize, context: &[u8; CONTEXT_SIZE]) -> Result<(), String> {
+    let Some(addr) = nt!("NtSetContextThread") else {
+        return Err("NtSetContextThread SSN unresolved".into());
+    };
+    let f: Fn2 = unsafe { std::mem::transmute(addr) };
+
+    let status = unsafe { f(handle, context.as_ptr() as usize) };
+    if status < 0 {
+        return Err(format!("NtSetContextThread failed ({status:#x})"));
+    }
+    Ok(())
+}
+
+pub fn context_rip(context: &[u8; CONTEXT_SIZE]) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&context[CONTEXT_OFFSET_RIP..CONTEXT_OFFSET_RIP + 8]);
+    u64::from_le_bytes(raw)
+}
+
+pub fn set_context_rip(context: &mut [u8; CONTEXT_SIZE], rip: u64) {
+    context[CONTEXT_OFFSET_RIP..CONTEXT_OFFSET_RIP + 8].copy_from_slice(&rip.to_le_bytes());
 }

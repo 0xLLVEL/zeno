@@ -3,6 +3,8 @@ mod commands;
 #[cfg(windows)]
 mod apc;
 #[cfg(windows)]
+mod hijack;
+#[cfg(windows)]
 mod injector;
 #[cfg(windows)]
 mod manualmap;

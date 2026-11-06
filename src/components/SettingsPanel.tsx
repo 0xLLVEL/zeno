@@ -42,7 +42,8 @@ export function SettingsPanel() {
                   | "loadlibrary"
                   | "manualmap"
                   | "section"
-                  | "apc",
+                  | "apc"
+                  | "hijack",
               })
             }
           >
@@ -50,6 +51,7 @@ export function SettingsPanel() {
             <option value="manualmap">Manual Map (stealth)</option>
             <option value="section">Section Image (file-backed)</option>
             <option value="apc">APC Queue (no new thread)</option>
+            <option value="hijack">Thread Hijack (no new thread, no APC)</option>
           </select>
         </label>
 

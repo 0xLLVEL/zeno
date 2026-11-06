@@ -27,6 +27,8 @@ pub fn inject(pid: u32, dll: &Path, method: &str) -> Result<(), String> {
         crate::section::map(pid, &dll)
     } else if method.eq_ignore_ascii_case("apc") {
         crate::apc::inject(pid, &dll).map(|_| ())
+    } else if method.eq_ignore_ascii_case("hijack") {
+        crate::hijack::inject(pid, &dll).map(|_| ())
     } else {
         load_library(pid, &dll)
     }

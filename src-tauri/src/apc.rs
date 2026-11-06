@@ -23,7 +23,7 @@ use windows::Win32::System::Threading::{
 
 use crate::nt;
 
-fn threads_of(pid: u32) -> Vec<u32> {
+pub(crate) fn threads_of(pid: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) } {
         Ok(h) if !h.is_invalid() => h,

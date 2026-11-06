@@ -12,7 +12,7 @@ inside the client, named-pipe bridge between them.
 │  pipe server               │        │   ├─ prelude (task/Instance) │
 │   \\.\pipe\zeno_in ────────┼───────▶│   └─ pipe client             │
 │   \\.\pipe\zeno_out ◀──────┼────────│                              │
-│  injector (LL/map/section/APC)│    │                              │
+│  injector (LL/map/sect/apc/hijack)│  │                              │
 └────────────────────────────┘        └──────────────────────────────┘
 ```
 
@@ -76,8 +76,16 @@ npm run tauri:build
 - `apc` (`src-tauri/src/apc.rs`) — same section map, but no thread is created.
   A 33-byte `DllMain(base, DLL_PROCESS_ATTACH, NULL)` stub is written into the
   target and queued with `NtQueueApcThread` on up to 16 existing threads. Since
-  no thread is created, thread-creation notification never fires; the work runs
-  on a thread Roblox itself created. Cost: stub is one unbacked RWX region.
+  no thread is created, thread-creation notification never fires. Caveat: a
+  user-mode APC only runs when the target thread enters an alertable wait, and
+  Roblox threads rarely do — this method can queue cleanly and never execute.
+- `hijack` (`src-tauri/src/hijack.rs`) — same section map, then an existing
+  thread is suspended, its `Rip` is redirected into a stub, and the thread is
+  resumed. The stub calls `DllMain` on a private scratch stack, then restores
+  every volatile register, `RFLAGS` and the original `Rip` via a
+  `jmp qword ptr [rip+0]`, so the interrupted thread continues where it
+  stopped. No thread is created, nothing is queued, and there is no alertable-
+  wait precondition.
 
 Every ntdll entry point used by `section` and `apc` goes through
 `src-tauri/src/nt.rs`, the direct-syscall layer:
@@ -100,13 +108,19 @@ Be clear about what the injection layer does and does not cover:
 
 | vector | covered |
 |---|---|
-| unbacked executable memory | yes, by `section` |
-| remote module list (LoadLibrary) | yes, by `manualmap` / `section` / `apc` |
+| unbacked executable memory | yes, for the payload itself — `section` / `apc` / `hijack` |
+| remote module list (LoadLibrary) | yes, by `manualmap` / `section` / `apc` / `hijack` |
 | ntdll hooks on NT calls | yes, by `nt` direct syscalls |
-| thread-creation notification (kernel) | yes, by `apc` — no thread is created |
+| thread-creation notification (kernel) | yes — `apc` and `hijack` create no thread |
+| APC / alertable-wait dependency | n/a for `hijack` |
 | handle filtering (kernel) | **no** — needs a driver or a signed loader |
 | image-load notification (kernel) | partially — section maps are real image views |
 | `.text` integrity checks | **no** |
+
+Both `apc` and `hijack` still write one small RX stub into the target. It has no
+file backing, so a strict unbacked-executable scan sees it even though the
+payload image itself is file-backed. Moving that stub inside the mapped view is
+the next increment.
 
 Hyperion (Byfron) on the Windows client ships a kernel component that owns
 handle filtering and `.text` page integrity. Usermode-only injection does not

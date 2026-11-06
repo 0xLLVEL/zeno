@@ -110,6 +110,8 @@ pub fn attach(state: State<'_, AppState>, pid: u32, method: String) -> Result<At
             "section-image"
         } else if method.eq_ignore_ascii_case("apc") {
             "apc-queue"
+        } else if method.eq_ignore_ascii_case("hijack") {
+            "thread-hijack"
         } else {
             "loadlibrary"
         };
