@@ -397,8 +397,7 @@ pub fn create_section(file: usize, protect: u32, attributes: u32) -> Result<usiz
     Ok(handle)
 }
 
-pub fn map_view(process: usize, section: usize, protect: u32) -> Result<usize, String> {
-    let Some(addr) = nt!("NtMapViewOfSection") else {
+pub fn map_view(process: usize, section: usize, protect: u32) -> Result<usize, String> {    let Some(addr) = nt!("NtMapViewOfSection") else {
         return Err("NtMapViewOfSection SSN unresolved".into());
     };
     let f: Fn10 = unsafe { std::mem::transmute(addr) };
@@ -425,8 +424,20 @@ pub fn map_view(process: usize, section: usize, protect: u32) -> Result<usize, S
     Ok(base)
 }
 
-pub fn queue_apc(thread: usize, routine: usize, argument: usize) -> Result<(), String> {
-    let Some(addr) = nt!("NtQueueApcThread") else {
+pub fn unmap_view(process: usize, base: usize) -> Result<(), String> {
+    let Some(addr) = nt!("NtUnmapViewOfSection") else {
+        return Err("NtUnmapViewOfSection SSN unresolved".into());
+    };
+    let f: Fn2 = unsafe { std::mem::transmute(addr) };
+
+    let status = unsafe { f(process, base) };
+    if status < 0 {
+        return Err(format!("NtUnmapViewOfSection failed ({status:#x})"));
+    }
+    Ok(())
+}
+
+pub fn queue_apc(thread: usize, routine: usize, argument: usize) -> Result<(), String> {    let Some(addr) = nt!("NtQueueApcThread") else {
         return Err("NtQueueApcThread SSN unresolved".into());
     };
     let f: Fn5 = unsafe { std::mem::transmute(addr) };
@@ -539,4 +550,88 @@ pub fn context_rip(context: &[u8; CONTEXT_SIZE]) -> u64 {
 
 pub fn set_context_rip(context: &mut [u8; CONTEXT_SIZE], rip: u64) {
     context[CONTEXT_OFFSET_RIP..CONTEXT_OFFSET_RIP + 8].copy_from_slice(&rip.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::PathBuf;
+
+    fn system_dll(name: &str) -> Option<PathBuf> {
+        let root = std::env::var_os("SystemRoot")?;
+        let path = PathBuf::from(root).join("System32").join(name);
+        path.exists().then_some(path)
+    }
+
+    fn self_pid() -> u32 {
+        std::process::id()
+    }
+
+    #[test]
+    fn ssn_table_resolves() {
+        assert!(available(), "Hell's Gate found no SSNs in ntdll");
+        for name in [
+            "NtOpenProcess",
+            "NtAllocateVirtualMemory",
+            "NtWriteVirtualMemory",
+            "NtProtectVirtualMemory",
+            "NtCreateSection",
+            "NtMapViewOfSection",
+            "NtUnmapViewOfSection",
+            "NtOpenThread",
+            "NtGetContextThread",
+        ] {
+            assert!(ssn(name).is_some(), "{name} unresolved");
+        }
+    }
+
+    #[test]
+    fn maps_image_into_own_process() {
+        assert!(available(), "no syscall layer");
+        let Some(dll) = system_dll("kernel32.dll") else {
+            return;
+        };
+        let file = std::fs::File::open(&dll).expect("open kernel32");
+
+        let section = create_section(file.as_raw_handle() as usize, PAGE_RO, SEC_IMAGE)
+            .expect("NtCreateSection");
+        let process = open_process(self_pid(), PROCESS_ALL).expect("NtOpenProcess");
+
+        let base = map_view(process, section, PAGE_RO).expect("NtMapViewOfSection");
+        let magic = unsafe { *(base as *const u16) };
+        assert_eq!(magic, 0x5A4D, "mapped view does not start with MZ");
+
+        unmap_view(process, base).expect("NtUnmapViewOfSection");
+
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                section as *mut _,
+            ));
+            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                process as *mut _,
+            ));
+        }
+    }
+
+    #[test]
+    fn allocate_write_protect_roundtrip() {
+        assert!(available(), "no syscall layer");
+        let process = open_process(self_pid(), PROCESS_ALL).expect("NtOpenProcess");
+
+        let memory = allocate(process, 0x1000).expect("NtAllocateVirtualMemory");
+        write(process, memory, b"zeno-4080").expect("NtWriteVirtualMemory");
+
+        let bytes = unsafe { std::slice::from_raw_parts(memory as *const u8, 9) };
+        assert_eq!(bytes, b"zeno-4080");
+
+        let old = protect(process, memory, 0x1000, PAGE_RX).expect("NtProtectVirtualMemory");
+        assert_eq!(old & 0xFF, PAGE_RW, "previous protection was not read-write");
+
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+                process as *mut _,
+            ));
+        }
+    }
 }
