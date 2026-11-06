@@ -251,20 +251,26 @@ int l_delay(lua_State* L) {
     return 0;
 }
 
+// Luau dropped the `lua_register` macro along with the aux library.
+void reg(lua_State* L, const char* name, lua_CFunction fn) {
+    lua_pushcfunction(L, fn, name);
+    lua_setglobal(L, name);
+}
+
 } // namespace
 
 void install_api(lua_State* L) {
     using namespace zeno::rbx;
 
-    lua_register(L, "__zeno_print", l_print);
-    lua_register(L, "__zeno_warn", l_warn);
-    lua_register(L, "__zeno_tick", l_tick);
-    lua_register(L, "__zeno_spawn", l_spawn);
-    lua_register(L, "__zeno_delay", l_delay);
+    reg(L, "__zeno_print", l_print);
+    reg(L, "__zeno_warn", l_warn);
+    reg(L, "__zeno_tick", l_tick);
+    reg(L, "__zeno_spawn", l_spawn);
+    reg(L, "__zeno_delay", l_delay);
 
-    lua_register(L, "zeno_capability", l_capability);
-    lua_register(L, "zeno_read_ptr", l_read_ptr);
-    lua_register(L, "zeno_datamodel", l_datamodel);
+    reg(L, "zeno_capability", l_capability);
+    reg(L, "zeno_read_ptr", l_read_ptr);
+    reg(L, "zeno_datamodel", l_datamodel);
 
     lua_newtable(L);
     int idx = 1;

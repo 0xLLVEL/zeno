@@ -47,4 +47,8 @@ T read_or(uintptr_t address, T fallback) {
 // Resolved lazily; null until init() succeeds.
 uintptr_t datamodel();
 
+// One-line, human-readable snapshot of everything resolved so far. Safe to
+// call before init(); it just reports zeros.
+std::string describe();
+
 } // namespace zeno::rbx

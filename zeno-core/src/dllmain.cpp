@@ -1,5 +1,6 @@
 #include <windows.h>
 
+#include <string>
 #include <string_view>
 
 #include "bridge.h"
@@ -26,8 +27,22 @@ DWORD WINAPI bootstrap(LPVOID) {
     }
 
     // 3. Attach the pipe bridge; every received frame runs on the worker.
-    zeno::bridge::start([](std::string_view script) {
-        zeno::Executor::instance().execute(script);
+    zeno::bridge::start([](std::string_view message) {
+        // Control frames stay here; everything else is Lua.
+        constexpr std::string_view kPrefix = "::zeno ";
+        if (message.rfind(kPrefix, 0) == 0) {
+            std::string_view command = message.substr(kPrefix.size());
+            while (!command.empty() && (command.back() == '\n' || command.back() == '\r')) {
+                command.remove_suffix(1);
+            }
+            if (command == "offsets") {
+                zeno::bridge::out("[zeno] " + zeno::rbx::describe());
+            } else {
+                zeno::bridge::out_warn("[zeno] unknown control command");
+            }
+            return;
+        }
+        zeno::Executor::instance().execute(message);
     });
 
     zeno::bridge::out("[zeno] ready — listening for scripts");

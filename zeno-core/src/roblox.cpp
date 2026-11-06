@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -181,5 +182,21 @@ uintptr_t find_pattern(std::string_view signature) {
 }
 
 uintptr_t datamodel() { return g_datamodel; }
+
+std::string describe() {
+    char buffer[512]{};
+    const uintptr_t dm = g_datamodel;
+    const uintptr_t workspace = dm ? read_or<uintptr_t>(dm + offset("DataModel.Workspace"), 0) : 0;
+    const uintptr_t script_context = dm ? read_or<uintptr_t>(dm + offset("DataModel.ScriptContext"), 0) : 0;
+    const uintptr_t scheduler_slot = offset("TaskScheduler.Pointer");
+    const uintptr_t scheduler = scheduler_slot ? read_or<uintptr_t>(module_base() + scheduler_slot, 0) : 0;
+
+    snprintf(buffer, sizeof(buffer),
+             "datamodel=0x%llX workspace=0x%llX scriptcontext=0x%llX taskscheduler=0x%llX offsets=%zu",
+             static_cast<unsigned long long>(dm), static_cast<unsigned long long>(workspace),
+             static_cast<unsigned long long>(script_context),
+             static_cast<unsigned long long>(scheduler), g_offsets.size());
+    return std::string(buffer);
+}
 
 } // namespace zeno::rbx
