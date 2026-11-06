@@ -1574,6 +1574,150 @@ fn chain_with(
     Ok(hops)
 }
 
+/// Every direct child of the data model, with the total count.
+pub fn children_tree(
+    pid: Option<u32>,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+    limit: usize,
+) -> Result<Vec<(String, String, u64)>, String> {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => live::find_pid(crate::CLIENT_EXE)
+            .ok_or_else(|| format!("{} is not running; pass --pid <n>", crate::CLIENT_EXE))?,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "OpenProcess({pid}) with PROCESS_ALL_ACCESS failed ({}); elevation is required",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let result = (|| {
+        let (base, _size, _path) = live::module_info(pid, module)
+            .ok_or_else(|| format!("module {module} is not loaded in pid {pid}"))?;
+        let fake = read_u64_live(
+            handle,
+            base + offsets.get("FakeDataModel::Pointer").copied().unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let datamodel = read_u64_live(
+            handle,
+            fake + offsets.get("FakeDataModel::RealDataModel").copied().unwrap_or(0),
+        )
+        .unwrap_or(0);
+        Ok(children(handle, datamodel, offsets, limit))
+    })();
+
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+/// `ScriptContext` and its vtable, read live. The vtable slot addresses are the
+/// only way to get real entry points without decrypting all of `.text`: a slot
+/// that is being executed is plaintext by definition.
+pub fn vtable(
+    pid: Option<u32>,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+    count: usize,
+) -> Result<VtableReport, String> {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => live::find_pid(crate::CLIENT_EXE)
+            .ok_or_else(|| format!("{} is not running; pass --pid <n>", crate::CLIENT_EXE))?,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "OpenProcess({pid}) with PROCESS_ALL_ACCESS failed ({}); elevation is required",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let result = vtable_with(handle, pid, module, offsets, count);
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+fn vtable_with(
+    handle: Handle,
+    pid: u32,
+    module: &str,
+    offsets: &HashMap<String, u64>,
+    count: usize,
+) -> Result<VtableReport, String> {
+    let (base, _size, _path) = live::module_info(pid, module)
+        .ok_or_else(|| format!("module {module} is not loaded in pid {pid}"))?;
+
+    let slot = |key: &str| base + offsets.get(key).copied().unwrap_or(0);
+
+    let fake = read_u64_live(handle, slot("FakeDataModel::Pointer")).unwrap_or(0);
+    let real_offset = offsets.get("FakeDataModel::RealDataModel").copied().unwrap_or(0);
+    let datamodel = read_u64_live(handle, fake + real_offset).unwrap_or(0);
+
+    // The pack's `DataModel::ScriptContext` is not the object pointer on this
+    // build, so walk the children and take the instance by name instead.
+    let mut context = 0u64;
+    let mut via = "member offset".to_string();
+    for (name, _class, address) in children(handle, datamodel, offsets, 400) {
+        let compact: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.eq_ignore_ascii_case("ScriptContext") || _class == "ScriptContext" {
+            context = address;
+            via = "child lookup".to_string();
+            break;
+        }
+    }
+    if context == 0 {
+        let context_offset = offsets.get("DataModel::ScriptContext").copied().unwrap_or(0);
+        context = read_u64_live(handle, datamodel + context_offset).unwrap_or(0);
+    }
+
+    let vptr = read_u64_live(handle, context).unwrap_or(0);
+
+    let mut entries = Vec::new();
+    for index in 0..count {
+        let address = read_u64_live(handle, vptr + (index as u64) * 8).unwrap_or(0);
+        let readable = if address >= 0x10000 {
+            matches!(
+                protection(handle, address).map(|(protect, state)| {
+                    state == 0x1000 && matches!(protect & 0xFF, 0x02 | 0x04 | 0x20 | 0x40 | 0x80)
+                }),
+                Some(true)
+            )
+        } else {
+            false
+        };
+        let in_module = address >= base && address < base + 0x93E1000;
+        entries.push((index, address, readable, in_module));
+    }
+
+    Ok(VtableReport {
+        pid,
+        base,
+        fake,
+        datamodel,
+        context,
+        vptr,
+        entries,
+        via,
+    })
+}
+
+pub struct VtableReport {
+    pub pid: u32,
+    pub base: u64,
+    pub fake: u64,
+    pub datamodel: u64,
+    pub context: u64,
+    pub vptr: u64,
+    pub entries: Vec<(usize, u64, bool, bool)>,
+    pub via: String,
+}
+
 /// Names and classes of an instance's direct children, in order.
 pub fn children_of(
     pid: Option<u32>,

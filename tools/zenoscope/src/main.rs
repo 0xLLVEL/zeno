@@ -41,6 +41,9 @@ struct Args {
     watch: Option<u64>,
     base: Option<PathBuf>,
     chain: Option<PathBuf>,
+    vtable: Option<PathBuf>,
+    children: Option<PathBuf>,
+    count: usize,
     follow: bool,
 }
 
@@ -60,6 +63,9 @@ fn parse_args() -> Result<Args, String> {
         watch: None,
         base: None,
         chain: None,
+        vtable: None,
+        children: None,
+        count: 64,
         follow: false,
     };
     let mut argv = std::env::args().skip(1);
@@ -106,6 +112,18 @@ fn parse_args() -> Result<Args, String> {
             "--chain" => {
                 args.chain = Some(PathBuf::from(argv.next().ok_or("--chain needs a pack")?));
             }
+            "--vtable" => {
+                args.vtable = Some(PathBuf::from(argv.next().ok_or("--vtable needs a pack")?));
+            }
+            "--children" => {
+                args.children = Some(PathBuf::from(argv.next().ok_or("--children needs a pack")?));
+            }
+            "--count" => {
+                let value = argv.next().ok_or("--count needs a number")?;
+                args.count = value
+                    .parse()
+                    .map_err(|_| format!("--count expects a number, got {value}"))?;
+            }
             "--follow" => {
                 args.follow = true;
             }
@@ -134,6 +152,8 @@ fn parse_args() -> Result<Args, String> {
                 println!("           --follow re-attaches when the client restarts");
                 println!("zenoscope --chain <hpp>     walk VisualEngine -> FakeDataModel -> DataModel");
                 println!("                            through the live client and print names");
+                println!("zenoscope --vtable <hpp>    print ScriptContext vtable slots with their page");
+                println!("           [--count <n>]    protection — plaintext entry points, live");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -553,6 +573,73 @@ fn run_inspect(args: &Args, count: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn run_children(args: &Args, pack_path: PathBuf) -> Result<(), String> {
+    let text = std::fs::read_to_string(&pack_path)
+        .map_err(|e| format!("cannot read {}: {e}", pack_path.display()))?;
+    let pack = hpp::Pack::parse(&text);
+
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+    for entry in &pack.entries {
+        offsets.insert(format!("{}::{}", entry.namespace, entry.name), entry.value);
+    }
+
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    let listing = dump::children_tree(args.pid, module, &offsets, args.count)?;
+
+    println!("zenoscope children  {module}  {} listed", listing.len());
+    for (index, (name, class, address)) in listing.iter().enumerate() {
+        println!("  {:>3}  0x{:<12X} {:<34} [{}]", index, address, name, class);
+    }
+
+    Ok(())
+}
+
+fn run_vtable(args: &Args, pack_path: PathBuf) -> Result<(), String> {
+    let text = std::fs::read_to_string(&pack_path)
+        .map_err(|e| format!("cannot read {}: {e}", pack_path.display()))?;
+    let pack = hpp::Pack::parse(&text);
+
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+    for entry in &pack.entries {
+        offsets.insert(format!("{}::{}", entry.namespace, entry.name), entry.value);
+    }
+
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    let report = dump::vtable(args.pid, module, &offsets, args.count)?;
+
+    println!("zenoscope vtable  {module}  pid {}", report.pid);
+    println!("  module base  0x{:X}", report.base);
+    println!("  FakeDataModel 0x{:X}", report.fake);
+    println!("  DataModel     0x{:X}", report.datamodel);
+    println!("  ScriptContext 0x{:X}  (via {})", report.context, report.via);
+    println!("  vtable        0x{:X}", report.vptr);
+    println!();
+    println!("  slot  address            page       readable  in module");
+
+    let mut page_hits = 0usize;
+    for (index, address, readable, in_module) in &report.entries {
+        if *readable {
+            page_hits += 1;
+        }
+        println!(
+            "  {:<4}  0x{:<16X} 0x{:<8X} {:<9} {}",
+            index,
+            address,
+            address & !0xFFF,
+            if *readable { "yes" } else { "NO" },
+            if *in_module { "yes" } else { "no" }
+        );
+    }
+
+    println!();
+    println!(
+        "  readable slots  {page_hits}/{} — these pages are decrypted right now",
+        report.entries.len()
+    );
+
+    Ok(())
+}
+
 fn run_chain(args: &Args, pack_path: PathBuf) -> Result<(), String> {
     let text = std::fs::read_to_string(&pack_path)
         .map_err(|e| format!("cannot read {}: {e}", pack_path.display()))?;
@@ -880,6 +967,14 @@ fn run() -> Result<(), String> {
 
     if let Some(count) = args.inspect {
         return run_inspect(&args, count);
+    }
+
+    if let Some(pack) = args.children.clone() {
+        return run_children(&args, pack);
+    }
+
+    if let Some(pack) = args.vtable.clone() {
+        return run_vtable(&args, pack);
     }
 
     if let Some(pack) = args.chain.clone() {
