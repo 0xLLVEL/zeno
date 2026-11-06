@@ -940,6 +940,7 @@ fn harvest(
 
     let mut image: Option<Vec<u8>> = None;
     let mut section: Option<Section> = None;
+    let mut sections: Vec<Section> = Vec::new();
     let mut captured: Vec<bool> = Vec::new();
     let mut raw = 0u64;
     let mut base = 0u64;
@@ -951,6 +952,9 @@ fn harvest(
     let mut readable_total = 0u64;
     let mut last_report = 0u64;
     let mut last_checkpoint = 0u64;
+    let mut last_gain = 0u64;
+    let mut last_count = 0u64;
+    let mut last_elapsed = 0u64;
 
     loop {
         let elapsed = started.elapsed().as_secs();
@@ -982,6 +986,7 @@ fn harvest(
                             .map_err(|e| format!("cannot read {}: {e}", origin.display()))?;
                         let parsed = PeImage::parse(bytes.clone())?;
                         before = counts(&parsed);
+                        sections = parsed.sections.clone();
                         let text = parsed
                             .sections
                             .iter()
@@ -1001,6 +1006,8 @@ fn harvest(
                                 crate::thousands(resumed)
                             );
                         }
+                        last_count = resumed;
+                        last_gain = elapsed;
                         module_path = next.path.clone();
                         out_path = Some(out.clone().unwrap_or_else(|| {
                             let mut path = src.clone();
@@ -1043,26 +1050,53 @@ fn harvest(
 
         let elapsed = started.elapsed().as_secs();
         if elapsed >= last_report + 5 {
-            last_report = elapsed;
-            let pid = target.as_ref().map(|t| t.pid).unwrap_or(0);
+            let count = captured.iter().filter(|c| **c).count() as u64;
+            let gained = count.saturating_sub(last_count);
+            if gained > 0 {
+                last_gain = elapsed;
+            }
+            let rate = if elapsed > last_elapsed {
+                gained as f64 * 60.0 / (elapsed - last_elapsed) as f64
+            } else {
+                0.0
+            };
+            let stall = elapsed.saturating_sub(last_gain);
             println!(
-                "  {:>4}s  pid {:>6}  {} / {} pages captured",
+                "  {:>4}s  pid {:>6}  {:>6} / {}  {:>5.1}%  +{:<5} {:>6.0}/min  idle {}s{}",
                 elapsed,
-                pid,
-                crate::thousands(captured.iter().filter(|c| **c).count() as u64),
-                crate::thousands(captured.len() as u64)
+                target.as_ref().map(|t| t.pid).unwrap_or(0),
+                crate::thousands(count),
+                crate::thousands(captured.len() as u64),
+                count as f64 * 100.0 / captured.len().max(1) as f64,
+                crate::thousands(gained),
+                rate,
+                stall,
+                if stall >= 60 { "  [nothing new]" } else { "" }
             );
+            last_report = elapsed;
+            last_count = count;
+            last_elapsed = elapsed;
         }
 
         if elapsed >= last_checkpoint + 60 {
             last_checkpoint = elapsed;
             if let (Some(path), Some(img)) = (&out_path, image.as_ref()) {
                 if std::fs::write(path, img).is_ok() {
+                    let count = captured.iter().filter(|c| **c).count() as u64;
                     println!(
-                        "  checkpoint   {} pages -> {}",
-                        crate::thousands(captured.iter().filter(|c| **c).count() as u64),
+                        "  checkpoint   {} pages ({:.1}%) -> {}",
+                        crate::thousands(count),
+                        count as f64 * 100.0 / captured.len().max(1) as f64,
                         path.display()
                     );
+                    if rebuild {
+                        let live = target.as_ref().map(|t| (t.handle, t.base));
+                        let parsed = PeImage::parse(img.clone())?;
+                        match write_rebuilt(img, &parsed.sections, live, path) {
+                            Ok(path) => println!("  rebuilt      {}", path.display()),
+                            Err(because) => println!("  rebuilt      skipped: {because}"),
+                        }
+                    }
                 }
             }
         }
@@ -1084,29 +1118,11 @@ fn harvest(
 
     let mut rebuilt_path = None;
     if rebuild {
-        match &target {
-            Some(t) => {
-                let parsed = PeImage::parse(image.clone())?;
-                let mut blocks = Vec::with_capacity(parsed.sections.len());
-                for sec in &parsed.sections {
-                    let mut block = seed_block(&image, sec);
-                    if sec.name != ".text" {
-                        fill_block(t.handle, t.base, sec, &mut block);
-                    }
-                    blocks.push(block);
-                }
-                let rebuilt = rebuild_image(&image, &parsed.sections, &blocks)?;
-                let mut path = output.clone();
-                path.set_file_name(format!(
-                    "{}.rebuilt.exe",
-                    path.file_stem().map(|n| n.to_string_lossy()).unwrap_or_default()
-                ));
-                std::fs::write(&path, &rebuilt)
-                    .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-                rebuilt_path = Some(path);
-            }
-            None => notes.push("rebuild skipped: the client is no longer running".into()),
+        let live = target.as_ref().map(|t| (t.handle, t.base));
+        if live.is_none() {
+            notes.push("rebuild ran without a live client; .data globals are zero".into());
         }
+        rebuilt_path = Some(write_rebuilt(&image, &sections, live, &output)?);
     }
 
     if pids.len() > 1 {
@@ -1140,6 +1156,35 @@ fn harvest(
         rebuilt: rebuilt_path,
         notes,
     })
+}
+
+/// Write `<stem>.rebuilt.exe` next to `output`. Sections other than `.text`
+/// silently keep their on-disk contents when the client is gone.
+fn write_rebuilt(
+    image: &[u8],
+    sections: &[Section],
+    live: Option<(Handle, u64)>,
+    output: &Path,
+) -> Result<PathBuf, String> {
+    let mut blocks = Vec::with_capacity(sections.len());
+    for section in sections {
+        let mut block = seed_block(image, section);
+        if section.name != ".text" {
+            if let Some((handle, base)) = live {
+                fill_block(handle, base, section, &mut block);
+            }
+        }
+        blocks.push(block);
+    }
+    let rebuilt = rebuild_image(image, sections, &blocks)?;
+
+    let mut path = output.to_path_buf();
+    path.set_file_name(format!(
+        "{}.rebuilt.exe",
+        path.file_stem().map(|n| n.to_string_lossy()).unwrap_or_default()
+    ));
+    std::fs::write(&path, &rebuilt).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 fn watch_with(
