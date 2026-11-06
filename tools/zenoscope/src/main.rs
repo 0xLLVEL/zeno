@@ -558,10 +558,11 @@ fn run_watch(args: &Args, seconds: u64) -> Result<(), String> {
         println!("  note         {note}");
     }
     println!(
-        "  pages        {} total, {} decrypted, {} newly captured in this pass",
+        "  pages        {} total, {} decrypted, {} newly captured in this pass ({}s)",
         thousands(report.pages_total),
         thousands(report.pages_readable),
-        thousands(report.new_pages)
+        thousands(report.new_pages),
+        report.seconds
     );
 
     println!();

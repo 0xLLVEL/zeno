@@ -645,7 +645,6 @@ fn force_with(
 
     let mut chunks = Vec::new();
     let mut cursor = 0u64;
-    let mut captured = 0u64;
 
     while ok && cursor < span {
         let len = (span - cursor).min(chunk_size as u64);
@@ -655,13 +654,13 @@ fn force_with(
             run_stub(handle, stub, param, address, buffer as u64, len);
         if !ran {
             notes.push(format!(
-                "the copy thread did not finish at rva 0x{cursor:X} (wait 0x{waited:X})"
+                "the copy thread did not finish at rva 0x{cursor:X} (wait 0x{waited:X}{})",
+                if waited == WAIT_TIMEOUT { ", timed out" } else { "" }
             ));
         }
 
         let mut changed = 0u64;
         if let Ok(bytes) = read_page(handle, buffer as u64, len as usize) {
-            captured += bytes.len() as u64;
             let file_bytes = raw.saturating_sub(cursor).min(bytes.len() as u64);
             if file_bytes > 0 {
                 let file_offset = section.raw_pointer as u64 + cursor;
@@ -988,7 +987,7 @@ fn rebuild_image(image: &[u8], sections: &[Section], blocks: &[Vec<u8>]) -> Resu
     out[..copy].copy_from_slice(&image[..copy]);
 
     let mut cursor = header_end;
-    for (index, section) in sections.iter().enumerate() {
+    for (index, _section) in sections.iter().enumerate() {
         let data = &blocks[index];
         let raw_size = align_up(data.len() as u64, file_alignment);
         let offset = align_up(cursor, file_alignment);
