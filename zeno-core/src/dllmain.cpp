@@ -1,5 +1,6 @@
 #include <windows.h>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -37,6 +38,31 @@ DWORD WINAPI bootstrap(LPVOID) {
             }
             if (command == "offsets") {
                 zeno::bridge::out("[zeno] " + zeno::rbx::describe());
+            } else if (command == "tree") {
+                const uintptr_t dm = zeno::rbx::datamodel();
+                if (dm == 0) {
+                    zeno::bridge::out_warn("[zeno] no data model");
+                } else {
+                    std::string line = "[zeno] root=";
+                    line += zeno::rbx::instance_name(dm);
+                    line += " class=";
+                    line += zeno::rbx::instance_class_name(dm);
+                    line += " children=";
+                    const auto children = zeno::rbx::instance_children(dm);
+                    line += std::to_string(children.size());
+                    zeno::bridge::out(line);
+
+                    size_t shown = 0;
+                    for (uintptr_t child : children) {
+                        if (shown++ == 20) break;
+                        std::string entry = "  ";
+                        entry += zeno::rbx::instance_name(child);
+                        entry += " [";
+                        entry += zeno::rbx::instance_class_name(child);
+                        entry += "]";
+                        zeno::bridge::out(entry);
+                    }
+                }
             } else {
                 zeno::bridge::out_warn("[zeno] unknown control command");
             }
