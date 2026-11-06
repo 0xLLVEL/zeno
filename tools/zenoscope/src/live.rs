@@ -75,6 +75,10 @@ pub struct Process {
 }
 
 impl Process {
+    pub fn handle(&self) -> Handle {
+        self.handle
+    }
+
     /// Newest process whose executable name matches, case-insensitively.
     pub fn open_by_name(exe_name: &str) -> Result<Process, String> {
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };

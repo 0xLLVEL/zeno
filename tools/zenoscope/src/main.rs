@@ -1,9 +1,9 @@
-//! zenoscope — resolve Roblox engine offsets without trusting hardcoded
+﻿//! zenoscope â€” resolve Roblox engine offsets without trusting hardcoded
 //! addresses.
 //!
 //! Two sources:
 //!   * a live client's mapped image (the only one that works on the shipped
-//!     client — its `.text` is encrypted on disk)
+//!     client â€” its `.text` is encrypted on disk)
 //!   * the file on disk (fallback, and how the tool is exercised in tests)
 
 mod dump;
@@ -11,6 +11,7 @@ mod hpp;
 mod image;
 mod live;
 mod scan;
+mod state;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -45,6 +46,20 @@ struct Args {
     children: Option<PathBuf>,
     count: usize,
     follow: bool,
+    find_state: bool,
+    state_cap_mb: usize,
+    pack: Option<PathBuf>,
+    find_value: Option<u64>,
+    find_vm: bool,
+    find_text: Option<String>,
+    read: Option<u64>,
+    probe_lua: Option<u64>,
+    find_string: Option<String>,
+    find_tt: Option<u8>,
+    find_stack: bool,
+    hunt: bool,
+    pair: Option<(u64, u64)>,
+    threads: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +82,20 @@ fn parse_args() -> Result<Args, String> {
         children: None,
         count: 64,
         follow: false,
+        find_state: false,
+        state_cap_mb: 4096,
+        pack: None,
+        find_value: None,
+        find_vm: false,
+        find_text: None,
+        read: None,
+        probe_lua: None,
+        find_string: None,
+        find_tt: None,
+        find_stack: false,
+        hunt: false,
+        pair: None,
+        threads: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -127,6 +156,75 @@ fn parse_args() -> Result<Args, String> {
             "--follow" => {
                 args.follow = true;
             }
+            "--findstate" => {
+                args.find_state = true;
+            }
+            "--pack" => {
+                args.pack = Some(PathBuf::from(argv.next().ok_or("--pack needs a pack")?));
+            }
+            "--read" => {
+                let value = argv.next().ok_or("--read needs an address")?;
+                let cleaned = value.trim_start_matches("0x").trim_start_matches("0X");
+                args.read = Some(u64::from_str_radix(cleaned, 16).map_err(|_| format!("--read expects hex, got {value}"))?);
+            }
+            "--findtext" => {
+                args.find_text = Some(argv.next().ok_or("--findtext needs text")?);
+            }
+            "--threads" => {
+                args.threads = true;
+            }
+            "--pair" => {
+                let first = argv.next().ok_or("--pair needs two addresses")?;
+                let second = argv.next().ok_or("--pair needs two addresses")?;
+                let parse = |value: &str| -> Result<u64, String> {
+                    let cleaned = value.trim_start_matches("0x").trim_start_matches("0X");
+                    u64::from_str_radix(cleaned, 16)
+                        .map_err(|_| format!("--pair expects hex, got {value}"))
+                };
+                args.pair = Some((parse(&first)?, parse(&second)?));
+            }
+            "--hunt" => {
+                args.hunt = true;
+            }
+            "--findstack" => {
+                args.find_stack = true;
+            }
+            "--findtt" => {
+                let value = argv.next().ok_or("--findtt needs a tag")?;
+                args.find_tt = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--findtt expects a number, got {value}"))?,
+                );
+            }
+            "--findstring" => {
+                args.find_string = Some(argv.next().ok_or("--findstring needs text")?);
+            }
+            "--probe-lua" => {
+                let value = argv.next().ok_or("--probe-lua needs an address")?;
+                let cleaned = value.trim_start_matches("0x").trim_start_matches("0X");
+                args.probe_lua = Some(
+                    u64::from_str_radix(cleaned, 16)
+                        .map_err(|_| format!("--probe-lua expects hex, got {value}"))?,
+                );
+            }
+            "--findvm" => {
+                args.find_vm = true;
+            }
+            "--findvalue" => {
+                let value = argv.next().ok_or("--findvalue needs an address")?;
+                let cleaned = value.trim_start_matches("0x").trim_start_matches("0X");
+                args.find_value = Some(
+                    u64::from_str_radix(cleaned, 16)
+                        .map_err(|_| format!("--findvalue expects hex, got {value}"))?,
+                );
+            }
+            "--state-cap-mb" => {
+                let value = argv.next().ok_or("--state-cap-mb needs a number")?;
+                args.state_cap_mb = value
+                    .parse()
+                    .map_err(|_| format!("--state-cap-mb expects a number, got {value}"))?;
+            }
             "--inspect" => {
                 let value = argv.next().ok_or("--inspect needs a page count")?;
                 args.inspect = Some(
@@ -153,7 +251,11 @@ fn parse_args() -> Result<Args, String> {
                 println!("zenoscope --chain <hpp>     walk VisualEngine -> FakeDataModel -> DataModel");
                 println!("                            through the live client and print names");
                 println!("zenoscope --vtable <hpp>    print ScriptContext vtable slots with their page");
-                println!("           [--count <n>]    protection — plaintext entry points, live");
+                println!("           [--count <n>]    protection â€” plaintext entry points, live");
+                println!("zenoscope --findstate       search the live client's private memory for a");
+                println!("           [--state-cap-mb <n>]  lua_State whose global_State points back");
+                println!("zenoscope --probe-lua <hex> walk out from an object two pointer hops looking");
+                println!("           [--count <n>]  for a lua_State + global_State string table");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -396,7 +498,7 @@ fn verify_pack(path: &PathBuf, image: &dyn Image, client: &str) -> Result<(), St
     println!("  pack version      {pack_version}");
     println!(
         "  version match     {}",
-        if version_match { "yes" } else { "NO — offsets are for another build" }
+        if version_match { "yes" } else { "NO â€” offsets are for another build" }
     );
     println!("  entries           {}", pack.entries.len());
 
@@ -409,7 +511,7 @@ fn verify_pack(path: &PathBuf, image: &dyn Image, client: &str) -> Result<(), St
     println!();
     println!("module-relative slots");
     if slots.is_empty() {
-        println!("  none — every entry is a struct offset");
+        println!("  none â€” every entry is a struct offset");
     }
     let mut slots_ok = 0usize;
     for entry in &slots {
@@ -560,11 +662,11 @@ fn run_inspect(args: &Args, count: usize) -> Result<(), String> {
     println!(
         "  verdict      {}",
         if code > 0 {
-            "protection lift reveals real code — PAGE_NOACCESS is the only wall"
+            "protection lift reveals real code â€” PAGE_NOACCESS is the only wall"
         } else if readable > 0 && identical == readable {
             "the bytes under the lifted protection are still the on-disk ciphertext"
         } else if readable > 0 {
-            "readable under the lift but not identical to disk — inspect the head bytes"
+            "readable under the lift but not identical to disk â€” inspect the head bytes"
         } else {
             "the protection cannot be lifted from outside"
         }
@@ -591,6 +693,471 @@ fn run_children(args: &Args, pack_path: PathBuf) -> Result<(), String> {
         println!("  {:>3}  0x{:<12X} {:<34} [{}]", index, address, name, class);
     }
 
+    Ok(())
+}
+
+
+fn run_findstate(args: &Args) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+
+    let (datamodel, context) = match &args.pack {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let pack = hpp::Pack::parse(&text);
+            let mut offsets: HashMap<String, u64> = HashMap::new();
+            for entry in &pack.entries {
+                offsets.insert(format!("{}::{}", entry.namespace, entry.name), entry.value);
+            }
+            let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+            let report = dump::vtable(args.pid, module, &offsets, 1)?;
+            println!(
+                "  world  DataModel 0x{:X}  ScriptContext 0x{:X}",
+                report.datamodel, report.context
+            );
+            (Some(report.datamodel), Some(report.context))
+        }
+        None => (None, None),
+    };
+
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    println!("zenoscope findstate  pid {}", process.pid);
+    let mut last = 0usize;
+    let (hits, scanned) = state::find_threads(&process, cap, |bytes| {
+        if bytes - last >= 128 * 1024 * 1024 {
+            last = bytes;
+            println!("  scanned {:.0} MiB", bytes as f64 / (1024.0 * 1024.0));
+        }
+    });
+    println!(
+        "  scanned {:.1} MiB  states {}",
+        scanned as f64 / (1024.0 * 1024.0),
+        hits.len()
+    );
+
+    let mut tag_counts = [0usize; 256];
+    for hit in &hits {
+        tag_counts[hit.tag as usize] += 1;
+    }
+    print!("  tags");
+    for (tag, count) in tag_counts.iter().enumerate() {
+        if *count > 0 {
+            print!(" 0x{tag:02X}:{count}");
+        }
+    }
+    println!();
+
+    struct Ranked<'a> {
+        hit: &'a state::Hit,
+        tags: usize,
+        world: usize,
+        world_at: u64,
+        arena: u64,
+        arena_size: usize,
+    }
+
+    let mut ranked: Vec<Ranked> = Vec::new();
+    for hit in &hits {
+        if hit.tag != 8 {
+            continue;
+        }
+        let kind = state::region_kind(&process, hit.state);
+        let kind_name = match kind {
+            0x20000 => "private",
+            0x40000 => "mapped",
+            0x1000000 => "image",
+            _ => "other",
+        };
+        println!(
+            "    tag8  state 0x{:X}  global 0x{:X}  stack 0x{:X}+{:#X}  kind {kind_name}  tags {}/16",
+            hit.state,
+            hit.global,
+            hit.stack,
+            hit.stack_size,
+            state::stack_tags(&process, hit.stack, 16)
+        );
+        let tags = state::stack_tags(&process, hit.stack, 16);
+        if kind != 0x20000 {
+            continue;
+        }
+        let (arena, arena_size) = state::region_of(&process, hit.state);
+        let mut world = 0usize;
+        let mut world_at = 0u64;
+        if ranked.len() < 32 && arena_size <= 256 * 1024 * 1024 {
+            for needle in [datamodel, context].into_iter().flatten() {
+                if let Some(address) =
+                    state::find_value_in_region(&process, arena, arena_size, needle, 1).first()
+                {
+                    world += 1;
+                    world_at = *address;
+                }
+            }
+        }
+        ranked.push(Ranked {
+            hit,
+            tags,
+            world,
+            world_at,
+            arena,
+            arena_size,
+        });
+    }
+
+    ranked.sort_by_key(|entry| (std::cmp::Reverse(entry.world), std::cmp::Reverse(entry.tags)));
+    println!("  validated threads {}", ranked.len());
+    for entry in ranked.iter().take(12) {
+        println!(
+            "    world {}/2  tags {}/16  state 0x{:X}  global 0x{:X}  stack 0x{:X}+{:#X}  arena 0x{:X} ({} KiB){}",
+            entry.world,
+            entry.tags,
+            entry.hit.state,
+            entry.hit.global,
+            entry.hit.stack,
+            entry.hit.stack_size,
+            entry.arena,
+            entry.arena_size / 1024,
+            if entry.world > 0 {
+                format!("  hit 0x{:X}", entry.world_at)
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    if let Some(entry) = ranked.first() {
+        println!();
+        println!("  state  0x{:X}", entry.hit.state);
+        println!("  global 0x{:X}", entry.hit.global);
+        println!("  stack  0x{:X}", entry.hit.stack);
+        print!("{}", state::hex(&process, entry.hit.state, 0x90));
+        print!("{}", state::hex(&process, entry.hit.stack, 0x60));
+        print!("{}", state::hex(&process, entry.hit.global, 0x60));
+    }
+
+    Ok(())
+}
+
+fn run_read(args: &Args, address: u64) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let len = args.count.max(16);
+    println!("zenoscope read  pid {}  0x{address:X}  {len:#X} bytes", process.pid);
+    print!("{}", state::hex(&process, address, len));
+    Ok(())
+}
+
+fn run_findtext(args: &Args, needle: &[u8]) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let mut scanned = 0usize;
+    let mut shown = 0usize;
+    println!("zenoscope findtext  pid {}  needle {:?}", process.pid, String::from_utf8_lossy(needle));
+    for (base, size) in state::regions(&process) {
+        if scanned >= cap || shown >= args.count {
+            break;
+        }
+        let len = size.min(cap - scanned);
+        scanned += len;
+        let mut offset = 0usize;
+        while offset < len && shown < args.count {
+            let chunk = (len - offset).min(state::CHUNK);
+            let Some(bytes) = process.read(base + offset as u64, chunk) else {
+                offset += chunk;
+                continue;
+            };
+            let mut index = 0usize;
+            while index + needle.len() <= bytes.len() && shown < args.count {
+                if &bytes[index..index + needle.len()] == needle {
+                    let address = base + offset as u64 + index as u64;
+                    println!();
+                    println!("  text 0x{address:X}  region 0x{base:X}");
+                    let start = address.saturating_sub(0x40);
+                    print!("{}", state::hex(&process, start, 0xA0));
+                    shown += 1;
+                }
+                index += 1;
+            }
+            offset += chunk;
+        }
+    }
+    println!();
+    println!("  scanned {:.1} MiB  shown {shown}", scanned as f64 / (1024.0 * 1024.0));
+    Ok(())
+}
+
+fn run_findthreads(args: &Args) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let (hits, scanned) = state::find_threads_by_tag(&process, cap, args.count);
+    println!(
+        "zenoscope threads  pid {}  scanned {:.1} MiB  hits {}",
+        process.pid,
+        scanned as f64 / (1024.0 * 1024.0),
+        hits.len()
+    );
+    for hit in &hits {
+        println!(
+            "  state 0x{:X}  stack+0x{:X} -> 0x{:X}  slots {}",
+            hit.state, hit.stack_at, hit.stack, hit.slots
+        );
+        print!("{}", state::hex(&process, hit.state, 0x80));
+    }
+    Ok(())
+}
+
+fn run_pair(args: &Args, first: u64, second: u64) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for (base, size) in state::regions(&process) {
+        if a.len() < 12 {
+            a.extend(state::find_value_in_region(&process, base, size, first, 12));
+        }
+        if b.len() < 12 {
+            b.extend(state::find_value_in_region(&process, base, size, second, 12));
+        }
+        if a.len() >= 12 && b.len() >= 12 {
+            break;
+        }
+    }
+    println!(
+        "zenoscope pair  pid {}  first {} hits  second {} hits",
+        process.pid,
+        a.len(),
+        b.len()
+    );
+    for one in &a {
+        for two in &b {
+            if one.abs_diff(*two) > 0x200 {
+                continue;
+            }
+            println!();
+            println!("  first slot 0x{one:X}  second slot 0x{two:X}");
+            let from = (*one).min(*two).saturating_sub(0x100) & !0xF;
+            print!("{}", state::hex(&process, from, 0x200));
+        }
+    }
+    Ok(())
+}
+
+fn run_hunt(args: &Args) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let hunt = state::lua_hunt(&process, cap);
+    println!(
+        "zenoscope hunt  pid {}  stack 0x{:X}  slots {}  pairs {}",
+        process.pid,
+        hunt.stack,
+        hunt.slots,
+        hunt.pairs.len()
+    );
+    if hunt.stack == 0 {
+        return Ok(());
+    }
+    print!("{}", state::hex(&process, hunt.stack, 0x80));
+    for (base_slot, last_slot) in &hunt.pairs {
+        println!();
+        println!("  stack slot 0x{base_slot:X}  last-ish 0x{last_slot:X}");
+        let from = (*base_slot).saturating_sub(0x100) & !0xF;
+        print!("{}", state::hex(&process, from, 0x240));
+    }
+    Ok(())
+}
+
+fn run_findstack(args: &Args) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let (runs, scanned) = state::find_stacks(&process, cap, args.count);
+    println!(
+        "zenoscope findstack  pid {}  scanned {:.1} MiB  runs {}",
+        process.pid,
+        scanned as f64 / (1024.0 * 1024.0),
+        runs.len()
+    );
+    for run in runs.iter().take(6) {
+        println!();
+        println!("  stack 0x{:X}  slots {}", run.base, run.slots);
+        print!("{}", state::hex(&process, run.base, 0x80));
+        let mut referrers = Vec::new();
+        for (base, size) in state::regions(&process) {
+            if referrers.len() >= 4 {
+                break;
+            }
+            let hits = state::find_value_in_region(&process, base, size, run.base, 4 - referrers.len());
+            referrers.extend(hits);
+        }
+        for address in referrers {
+            println!("    ref 0x{address:X}");
+            let start = address.saturating_sub(0x38);
+            print!("{}", state::hex(&process, start, 0x90));
+        }
+    }
+    Ok(())
+}
+
+fn run_findtt(args: &Args, tag: u8) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let (states, scanned) = state::find_states_by_tag(&process, tag, cap, args.count);
+    println!(
+        "zenoscope findtt  pid {}  tag {}  scanned {:.1} MiB  states {}",
+        process.pid,
+        tag,
+        scanned as f64 / (1024.0 * 1024.0),
+        states.len()
+    );
+    for state in &states {
+        println!();
+        println!("  state 0x{state:X}");
+        print!("{}", state::hex(&process, *state - 8, 0x80));
+    }
+    Ok(())
+}
+
+fn run_findstring(args: &Args, needle: &[u8]) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let (objects, scanned) = state::find_string_objects(&process, needle, cap, args.count);
+    println!(
+        "zenoscope findstring  pid {}  {:?}",
+        process.pid,
+        String::from_utf8_lossy(needle)
+    );
+    println!(
+        "  scanned {:.1} MiB  objects {}",
+        scanned as f64 / (1024.0 * 1024.0),
+        objects.len()
+    );
+    for object in objects.iter().take(args.count) {
+        println!();
+        println!("  tstring 0x{object:X}");
+        print!("{}", state::hex(&process, *object, 0x20 + needle.len()));
+    }
+    Ok(())
+}
+
+fn run_probe_lua(args: &Args, root: u64) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    println!(
+        "zenoscope probe-lua  pid {}  root 0x{root:X}",
+        process.pid
+    );
+    print!("{}", state::hex(&process, root, 0x80));
+
+    let paths = state::probe_lua(&process, root, args.count.max(0x40));
+    println!("  paths {}", paths.len());
+    for path in &paths {
+        println!(
+            "    holder 0x{:X} slot +0x{:X}  state 0x{:X}  global 0x{:X}  buckets {}  nuse {}",
+            path.holder, path.slot, path.state, path.global, path.buckets, path.nuse
+        );
+    }
+    for path in paths.iter().take(3) {
+        println!();
+        println!("  state  0x{:X}", path.state);
+        print!("{}", state::hex(&process, path.state, 0x80));
+        println!("  global 0x{:X}", path.global);
+        print!("{}", state::hex(&process, path.global, 0x40));
+    }
+    Ok(())
+}
+
+fn run_findvm(args: &Args) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    println!("zenoscope findvm  pid {}", process.pid);
+    let (vms, scanned) = state::find_vms(&process, cap);
+    println!(
+        "  scanned {:.1} MiB  string tables {}",
+        scanned as f64 / (1024.0 * 1024.0),
+        vms.len()
+    );
+    for vm in &vms {
+        println!(
+            "  global 0x{:X}  nuse {:>6}  buckets {:>7}  thread {}",
+            vm.global,
+            vm.nuse,
+            vm.size,
+            match vm.thread {
+                Some(thread) => format!("0x{thread:X}"),
+                None => "?".into(),
+            }
+        );
+    }
+    for vm in vms.iter().filter(|vm| vm.thread.is_some()).take(2) {
+        let thread = vm.thread.unwrap();
+        println!();
+        println!("  global 0x{:X}", vm.global);
+        print!("{}", state::hex(&process, thread, 0x90));
+        print!("{}", state::hex(&process, vm.global, 0x40));
+    }
+    Ok(())
+}
+
+fn run_findvalue(args: &Args, needle: u64) -> Result<(), String> {
+    let process = match args.pid {
+        Some(pid) => Process::open_pid(pid)?,
+        None => Process::open_by_name(CLIENT_EXE)?,
+    };
+    let cap = args.state_cap_mb.saturating_mul(1024 * 1024);
+    let mut scanned = 0usize;
+    let mut shown = 0usize;
+    println!("zenoscope findvalue  pid {}  needle 0x{needle:X}", process.pid);
+    for (base, size) in state::regions(&process) {
+        if scanned >= cap || shown >= args.count {
+            break;
+        }
+        let len = size.min(cap - scanned);
+        let hits = state::find_value_in_region(&process, base, len, needle, 16);
+        scanned += len;
+        for address in hits {
+            if shown >= args.count {
+                break;
+            }
+            let kind = state::region_kind(&process, address);
+            println!();
+            println!(
+                "  hit 0x{address:X}  region 0x{base:X}  kind 0x{kind:X}"
+            );
+            let start = address.saturating_sub(0x40);
+            print!("{}", state::hex(&process, start, 0x80));
+            shown += 1;
+        }
+    }
+    println!();
+    println!("  scanned {:.1} MiB  shown {shown}", scanned as f64 / (1024.0 * 1024.0));
     Ok(())
 }
 
@@ -633,7 +1200,7 @@ fn run_vtable(args: &Args, pack_path: PathBuf) -> Result<(), String> {
 
     println!();
     println!(
-        "  readable slots  {page_hits}/{} — these pages are decrypted right now",
+        "  readable slots  {page_hits}/{} â€” these pages are decrypted right now",
         report.entries.len()
     );
 
@@ -827,7 +1394,7 @@ fn run_force(args: &Args) -> Result<(), String> {
         } else if report.prologues_after[0] > report.prologues_before[0] {
             "some pages decrypted, the read fault is handled only part of the way"
         } else {
-            "no new pages — the fault did not reach the client's handler"
+            "no new pages â€” the fault did not reach the client's handler"
         }
     );
     println!(
@@ -929,9 +1496,9 @@ fn run_dump(args: &Args) -> Result<(), String> {
         if code_after > 100 {
             "code pages decrypted; the dump is analysable"
         } else if code_after > code_before {
-            "partial decrypt — some pages stayed encrypted"
+            "partial decrypt â€” some pages stayed encrypted"
         } else {
-            "nothing decrypted — the flush no longer forces a fault"
+            "nothing decrypted â€” the flush no longer forces a fault"
         }
     );
     println!("  wrote        {} ({} bytes)", report.output.display(), thousands(report.output_bytes));
@@ -952,6 +1519,54 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+
+    if args.threads {
+        return run_findthreads(&args);
+    }
+
+    if let Some((first, second)) = args.pair {
+        return run_pair(&args, first, second);
+    }
+
+    if args.hunt {
+        return run_hunt(&args);
+    }
+
+    if args.find_stack {
+        return run_findstack(&args);
+    }
+
+    if let Some(tag) = args.find_tt {
+        return run_findtt(&args, tag);
+    }
+
+    if let Some(text) = args.find_string.clone() {
+        return run_findstring(&args, text.as_bytes());
+    }
+
+    if let Some(address) = args.probe_lua {
+        return run_probe_lua(&args, address);
+    }
+
+    if let Some(address) = args.read {
+        return run_read(&args, address);
+    }
+
+    if let Some(text) = args.find_text.clone() {
+        return run_findtext(&args, text.as_bytes());
+    }
+
+    if args.find_vm {
+        return run_findvm(&args);
+    }
+
+    if let Some(needle) = args.find_value {
+        return run_findvalue(&args, needle);
+    }
+
+    if args.find_state {
+        return run_findstate(&args);
+    }
 
     if args.dump {
         return run_dump(&args);
@@ -1221,3 +1836,6 @@ fn run() -> Result<(), String> {
 
     Ok(())
 }
+
+
+
