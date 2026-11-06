@@ -216,6 +216,17 @@ struct Baseline {
     unowned_image: Vec<u64>,
 }
 
+impl Baseline {
+    /// A page inside a module that was already loaded when the baseline was
+    /// taken can be judged; one inside a module that appeared later cannot,
+    /// because its pages were never observed in a clean state.
+    fn covers(&self, address: u64) -> bool {
+        self.modules
+            .iter()
+            .any(|(base, size)| address >= *base && address < *base + *size)
+    }
+}
+
 struct Report {
     findings: Vec<Finding>,
     counts: [u64; 3],
@@ -720,12 +731,18 @@ fn scan(handle: Handle, baseline: Option<&Baseline>, options: &Options) -> Repor
                     }
                     let address = region.base + (index as u64) * PAGE_SIZE;
                     let detail = describe(&modules, address);
-                    let reported = match baseline.and_then(|base| base.pages.get(&address)) {
-                        // A page that was shared and is now private is the only
-                        // shape a byte-identical rewrite leaves behind.
-                        Some(true) => true,
-                        Some(false) => false,
+                    let reported = match baseline {
                         None => options.strict && options.module.is_some(),
+                        Some(base) => {
+                            if !base.covers(address) {
+                                continue;
+                            }
+                            // Shared then, private now — the footprint of a
+                            // rewrite. A page absent from the baseline was not
+                            // resident yet: resident image code is always the
+                            // file view, so private still means written.
+                            !matches!(base.pages.get(&address), Some(false))
+                        }
                     };
                     if !reported {
                         report.informational[Rule::R3.index()] += 1;

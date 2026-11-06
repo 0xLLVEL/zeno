@@ -3,6 +3,7 @@
 //! The injector only writes the DLL path and starts `LoadLibraryW`; everything
 //! after that runs inside the target, where its own memory is ordinary memory.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -1129,8 +1130,10 @@ fn hijack(
         unsafe {
             *(patched.as_mut_ptr().add(0xF8) as *mut u64) = target;
             *(patched.as_mut_ptr().add(0x98) as *mut u64) = stack_top;
-            *(patched.as_mut_ptr().add(0x78) as *mut u64) = arg;
-            *(patched.as_mut_ptr().add(0x80) as *mut u64) = 0;
+            // Win64 ABI: first argument is RCX (0x80), second RDX (0x88). RAX
+            // carries nothing on entry.
+            *(patched.as_mut_ptr().add(0x80) as *mut u64) = arg;
+            *(patched.as_mut_ptr().add(0x88) as *mut u64) = 0;
         }
         if unsafe { SetThreadContext(thread, patched.as_ptr() as *const c_void) } == 0 {
             unsafe {
@@ -1709,8 +1712,52 @@ fn oracle(pid: u32) -> Result<(), String> {
 /// file view. Sampling is passive by comparison — suspend a thread, read RIP and
 /// RCX, resume. When RIP lands inside a function of interest, RCX is its first
 /// argument, which for `luaD_call` is the thread state.
-fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), String> {
+/// Reads raw memory as qwords. Used to lay out a captured `lua_State` field by
+/// field instead of trusting an offset table.
+fn dump_memory(pid: u32, address: u64, length: usize) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    dump_in(handle, address, length);
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+fn dump_in(handle: Handle, address: u64, length: usize) {
+    let mut offset = 0usize;
+    while offset < length {
+        let chunk = (length - offset).min(0x40);
+        let mut bytes = vec![0u8; chunk];
+        let mut got = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                handle,
+                (address + offset as u64) as *const c_void,
+                bytes.as_mut_ptr() as *mut c_void,
+                chunk,
+                &mut got,
+            )
+        };
+        if ok == 0 || got != chunk {
+            println!("dump        0x{:X} unreadable", address + offset as u64);
+            break;
+        }
+        let words: Vec<String> = bytes
+            .chunks_exact(8)
+            .map(|word| {
+                format!(
+                    "{:016X}",
+                    u64::from_le_bytes(word.try_into().expect("eight bytes"))
+                )
+            })
+            .collect();
+        println!("dump        +{:04X}  {}", offset, words.join(" "));
+        offset += chunk;
+    }
+}
+
+fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), String> {    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
     }
@@ -1725,89 +1772,586 @@ fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), Strin
         entry + span
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let ids = threads_of(pid);
+    let mut threads: Vec<(u32, Handle)> = Vec::new();
+    for id in ids {
+        let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+        if !thread.is_null() {
+            threads.push((id, thread));
+        }
+    }
+    println!("sampler     {} threads held open", threads.len());
+
+    // Phase A — which thread spends its time where. One pass over every thread
+    // is low resolution, so the point is not to catch the target but to find
+    // the thread that runs the interpreter.
+    let mut histogram: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
     let mut samples = 0u64;
-    let mut hits = 0u64;
-    while std::time::Instant::now() < deadline && hits == 0 {
-        for id in threads_of(pid) {
-            let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
-            if thread.is_null() {
-                continue;
+    let phase_a_seconds = (seconds / 3).max(4);
+    let phase_a_end = std::time::Instant::now() + std::time::Duration::from_secs(phase_a_seconds);
+    while std::time::Instant::now() < phase_a_end {
+        for (id, thread) in &threads {
+            if let Some(rip) = context_rip(*thread) {
+                samples += 1;
+                if rip >= client.base && rip < client.base + client.size {
+                    *histogram
+                        .entry(*id)
+                        .or_default()
+                        .entry(rip - client.base)
+                        .or_insert(0) += 1;
+                }
             }
-            unsafe { SuspendThread(thread) };
+        }
+    }
+    println!("sampler     phase A: {samples} samples over {phase_a_seconds}s");
+
+    // Rank each thread by how much of its time lands in the Luau window around
+    // the sampled function.
+    let window_lo = (rva as u64).saturating_sub(0x10000);
+    let window_hi = rva as u64 + 0x60000;
+    let mut candidates: Vec<(u32, u32)> = Vec::new();
+    let mut ranked_threads: Vec<(u32, u32, u64)> = Vec::new();
+    for (id, offsets) in &histogram {
+        let total: u32 = offsets.values().sum();
+        let mut sorted: Vec<(u64, u32)> = offsets.iter().map(|(k, v)| (*k, *v)).collect();
+        sorted.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let top = sorted.first().map(|(offset, _)| *offset).unwrap_or(0);
+        ranked_threads.push((*id, total, top));
+        let in_window: u32 = sorted
+            .iter()
+            .filter(|(offset, _)| *offset >= window_lo && *offset <= window_hi)
+            .map(|(_, count)| *count)
+            .sum();
+        if in_window > 0 {
+            candidates.push((in_window, *id));
+            let shown = sorted
+                .iter()
+                .take(3)
+                .map(|(offset, count)| format!("+0x{offset:X} x{count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "sampler     thread {id}: {total} samples, {in_window} in window [{shown}]"
+            );
+        }
+    }
+    ranked_threads.sort_by_key(|(_, total, _)| std::cmp::Reverse(*total));
+    for (id, total, top) in ranked_threads.iter().take(6) {
+        if candidates.iter().any(|(_, candidate)| candidate == id) {
+            continue;
+        }
+        println!("sampler     thread {id}: {total} samples, top +0x{top:X}");
+    }
+    candidates.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+
+    // Phase B — hammer only the candidates. One thread at a time raises the
+    // rate from hundreds of samples to tens of thousands.
+    let remaining = seconds.saturating_sub(phase_a_seconds).max(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(remaining);
+    let mut spins = 0u64;
+    let mut last_report = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        for (_, id) in &candidates {
+            let Some((_, thread)) = threads.iter().find(|(tid, _)| tid == id) else {
+                continue;
+            };
+            unsafe { SuspendThread(*thread) };
             let mut context = vec![0u8; CONTEXT_SIZE];
             unsafe {
                 *(context.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
             }
-            if unsafe { GetThreadContext(thread, context.as_mut_ptr() as *mut c_void) } != 0 {
-                samples += 1;
-                let rip = unsafe { *(context.as_ptr().add(0xF8) as *const u64) };
-                if rip >= entry && rip < entry + span {
-                    hits += 1;
-                    let rcx = unsafe { *(context.as_ptr().add(0x78) as *const u64) };
-                    let rdx = unsafe { *(context.as_ptr().add(0x80) as *const u64) };
-                    let r8 = unsafe { *(context.as_ptr().add(0x88) as *const u64) };
-                    println!(
-                        "sampler     hit thread {id} rip 0x{rip:X} (+0x{:X}) rcx 0x{rcx:X} rdx 0x{rdx:X} r8 0x{r8:X}",
-                        rip - entry
-                    );
-                    describe_state(handle, rcx);
+            let ok = unsafe { GetThreadContext(*thread, context.as_mut_ptr() as *mut c_void) } != 0;
+            let rip = unsafe { *(context.as_ptr().add(0xF8) as *const u64) };
+            // CONTEXT layout: RAX 0x78, RCX 0x80, RDX 0x88, RBX 0x90.
+            // luaD_call moves RCX into RBX at +0x0D, so past that point the
+            // state lives in RBX and RCX is scratch.
+            let rcx = unsafe { *(context.as_ptr().add(0x80) as *const u64) };
+            let rbx = unsafe { *(context.as_ptr().add(0x90) as *const u64) };
+            unsafe { ResumeThread(*thread) };
+            if !ok {
+                continue;
+            }
+            spins += 1;
+            if rip >= entry && rip < entry + span {
+                let state = if rip >= entry + 0x0D { rbx } else { rcx };
+                println!(
+                    "sampler     hit thread {id} rip 0x{rip:X} (+0x{:X}) state 0x{state:X} (rcx 0x{rcx:X} rbx 0x{rbx:X}) after {spins} spins",
+                    rip - entry
+                );
+                describe_state(handle, &modules, state);
+                println!("sampler     raw state:");
+                dump_in(handle, state, 0x100);
+                for (_, thread) in &threads {
+                    unsafe { CloseHandle(*thread) };
                 }
+                unsafe { CloseHandle(handle) };
+                return Ok(());
             }
-            unsafe {
-                ResumeThread(thread);
-                CloseHandle(thread);
-            }
-            if hits > 0 {
-                break;
+            if last_report.elapsed() > std::time::Duration::from_secs(5) {
+                println!(
+                    "sampler     thread {id} rip +0x{:X}, {spins} spins, no hit yet",
+                    rip.wrapping_sub(client.base)
+                );
+                last_report = std::time::Instant::now();
             }
         }
-        if samples % 5000 < 200 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if candidates.is_empty() {
+            break;
         }
     }
-    println!("sampler     {samples} thread samples, {hits} hits");
+    println!("sampler     {spins} focused spins, no hit in window");
+    for (_, thread) in &threads {
+        unsafe { CloseHandle(*thread) };
+    }
     unsafe { CloseHandle(handle) };
     Ok(())
 }
 
-/// Prints the fields of a candidate `lua_State` so a false hit is obvious.
-fn describe_state(handle: Handle, state: u64) {
-    if state < 0x10000 || state % 8 != 0 {
-        println!("sampler     rcx 0x{state:X} does not look like a pointer");
-        return;
+fn context_rip(thread: Handle) -> Option<u64> {
+    unsafe { SuspendThread(thread) };
+    let mut context = vec![0u8; CONTEXT_SIZE];
+    unsafe { *(context.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+    let ok = unsafe { GetThreadContext(thread, context.as_mut_ptr() as *mut c_void) } != 0;
+    unsafe { ResumeThread(thread) };
+    if !ok {
+        return None;
     }
-    let fields = [
-        ("stack_base", 0x28u64),
-        ("stack", 0x48),
-        ("global", 0x50),
-        ("base", 0x58),
-        ("top", 0x60),
-        ("ci", 0x70),
-        ("stack_last", 0x78),
-    ];
-    for (name, offset) in fields {
-        match read_u64_checked(handle, state + offset) {
-            Some(value) => println!("sampler       {name:<11} +0x{offset:02X} = 0x{value:X}"),
-            None => {
-                println!("sampler       {name:<11} +0x{offset:02X} unreadable, not a state");
-                return;
-            }
-        }
-    }
-    let status = unsafe {
-        let mut byte = 0u8;
-        let mut got = 0usize;
+    Some(unsafe { *(context.as_ptr().add(0xF8) as *const u64) })
+}
+
+// ---------------------------------------------------------------------------
+// Luau layout for version-f0ea5da9412f4e35 (Credoxy 2.6.9 dump).
+// Field offsets are the ones the client actually reads; `base` and `stacksize`
+// are pointer-encoded in memory, so they are shown raw and marked.
+// ---------------------------------------------------------------------------
+const LUA_U8_TT: u64 = 0x1;
+const LUA_U8_STATUS: u64 = 0x3;
+const LUA_U64_USERDATA: u64 = 0x8;
+const LUA_U64_GT: u64 = 0x10;
+const LUA_U64_NAMECALL: u64 = 0x18;
+const LUA_U64_END_CI: u64 = 0x20;
+const LUA_U64_BASE_CI: u64 = 0x28;
+const LUA_U64_STACK: u64 = 0x48;
+const LUA_U64_GLOBAL: u64 = 0x50;
+const LUA_U64_BASE_ENC: u64 = 0x58;
+const LUA_U64_TOP: u64 = 0x60;
+const LUA_U64_STACK_LAST: u64 = 0x68;
+const LUA_U64_CI: u64 = 0x70;
+const LUA_U64_STACKSIZE_ENC: u64 = 0x78;
+const LUA_I32_SIZE_CI: u64 = 0x7c;
+
+const G_U64_MAINTHREAD: u64 = 0x78;
+const G_U64_GC_THRESHOLD: u64 = 0x60;
+const G_U64_TOTALBYTES: u64 = 0x68;
+const G_U64_BUILTIN_PCALL: u64 = 0x5488;
+const G_U64_BUILTIN_XPCALL: u64 = 0x5490;
+const G_U64_PTRENCKEY: u64 = 0x650;
+
+const CLOSURE_U8_NUPVALUES: u64 = 0x4;
+const CLOSURE_U8_IS_C: u64 = 0x5;
+const CLOSURE_U64_ENV: u64 = 0x10;
+const CLOSURE_U64_F: u64 = 0x28;
+
+const CALLINFO_STRIDE: u64 = 0x30;
+const CI_U64_BASE: u64 = 0x0;
+const CI_U64_TOP: u64 = 0x8;
+const CI_U64_FUNC: u64 = 0x10;
+const CI_U64_PROTO: u64 = 0x18;
+const CI_U64_SAVEDPC: u64 = 0x20;
+const CI_I32_NRESULTS: u64 = 0x28;
+const CI_U32_FLAGS: u64 = 0x2c;
+
+const PROTO_U64_CODE: u64 = 0x68;
+
+const TVAL_U64_VALUE: u64 = 0x0;
+const TVAL_I32_TT: u64 = 0xc;
+
+const EXTRA_U64_SHARED: u64 = 0x18;
+const SHARED_U64_HEAD: u64 = 0x8;
+const SHARED_U64_COUNT: u64 = 0x0;
+const SHARED_U64_SCRIPT_CONTEXT: u64 = 0x18;
+const SHARED_I32_THREADCOUNT: u64 = 0x20;
+
+/// `EB FE` filler in the client's `.text`, used as a parking lot: a hijacked
+/// thread that returns here spins without touching its stack, so the original
+/// context can be put back at leisure.
+const PARK_RVA: u64 = 0x4320D92;
+
+const LUA_TTHREAD: u8 = 8;
+const LUA_TFUNCTION: i32 = 6;
+
+fn read_bytes(handle: Handle, address: u64, length: usize) -> Option<Vec<u8>> {
+    let mut buffer = vec![0u8; length];
+    let mut got = 0usize;
+    let ok = unsafe {
         ReadProcessMemory(
             handle,
-            (state + 0xA) as *const c_void,
-            &mut byte as *mut u8 as *mut c_void,
-            1,
+            address as *const c_void,
+            buffer.as_mut_ptr() as *mut c_void,
+            length,
             &mut got,
-        );
-        byte
+        )
     };
-    println!("sampler       status      +0x0A = {status}");
+    if ok == 0 || got != length {
+        return None;
+    }
+    Some(buffer)
+}
+
+fn read_u8_at(handle: Handle, address: u64) -> Option<u8> {
+    read_bytes(handle, address, 1).map(|bytes| bytes[0])
+}
+
+fn read_u32_at(handle: Handle, address: u64) -> Option<u32> {
+    read_bytes(handle, address, 4).map(|bytes| u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+}
+
+fn read_i32_at(handle: Handle, address: u64) -> Option<i32> {
+    read_u32_at(handle, address).map(|value| value as i32)
+}
+
+fn module_hit(modules: &[Module], address: u64) -> String {
+    for module in modules {
+        if address >= module.base && address < module.base + module.size {
+            return format!("{}+0x{:X}", module.name, address - module.base);
+        }
+    }
+    format!("0x{address:X}")
+}
+
+fn module_name_at(modules: &[Module], address: u64) -> Option<&str> {
+    modules
+        .iter()
+        .find(|module| address >= module.base && address < module.base + module.size)
+        .map(|module| module.name.as_str())
+}
+
+fn describe_closure(handle: Handle, modules: &[Module], label: &str, closure: u64) {
+    if closure == 0 {
+        println!("vminfo      {label:<14} 0x0");
+        return;
+    }
+    let is_c = read_u8_at(handle, closure + CLOSURE_U8_IS_C).unwrap_or(0xff);
+    let nup = read_u8_at(handle, closure + CLOSURE_U8_NUPVALUES).unwrap_or(0xff);
+    let env = read_u64(handle, closure + CLOSURE_U64_ENV);
+    let function = read_u64(handle, closure + CLOSURE_U64_F);
+    println!(
+        "vminfo      {label:<14} 0x{closure:X} isC {is_c} nup {nup} env {} f {}",
+        module_hit(modules, env),
+        module_hit(modules, function)
+    );
+}
+
+/// Prints a candidate `lua_State` against the real layout so a false hit is
+/// obvious: `stack < top <= stack_last`, a readable `global`, and a `ci` that
+/// sits inside `base_ci .. end_ci`.
+fn describe_state(handle: Handle, modules: &[Module], state: u64) {
+    if state < 0x10000 || state % 8 != 0 {
+        println!("vminfo      rcx 0x{state:X} does not look like a pointer");
+        return;
+    }
+    let aa = read_u8_at(handle, state + LUA_U8_TT).unwrap_or(0xff);
+    let status = read_u8_at(handle, state + LUA_U8_STATUS).unwrap_or(0xff);
+    let userdata = read_u64(handle, state + LUA_U64_USERDATA);
+    let gt = read_u64(handle, state + LUA_U64_GT);
+    let stack = read_u64(handle, state + LUA_U64_STACK);
+    let global = read_u64(handle, state + LUA_U64_GLOBAL);
+    let base = read_u64(handle, state + LUA_U64_BASE_ENC);
+    let top = read_u64(handle, state + LUA_U64_TOP);
+    let stack_last = read_u64(handle, state + LUA_U64_STACK_LAST);
+    let ci = read_u64(handle, state + LUA_U64_CI);
+    let base_ci = read_u64(handle, state + LUA_U64_BASE_CI);
+    let end_ci = read_u64(handle, state + LUA_U64_END_CI);
+    let stacksize = read_u64(handle, state + LUA_U64_STACKSIZE_ENC);
+    let size_ci = read_i32_at(handle, state + LUA_I32_SIZE_CI).unwrap_or(0);
+
+    println!("vminfo      state        0x{state:X}");
+    println!("vminfo      tt={aa} status={status} {}", if aa == LUA_TTHREAD { "(thread)" } else { "(NOT a thread)" });
+    println!("vminfo      userdata     {}  (delta 0x{:X})", module_hit(modules, userdata), userdata.wrapping_sub(state));
+    println!("vminfo      gt           {}", module_hit(modules, gt));
+    println!("vminfo      stack        0x{stack:X}");
+    println!("vminfo      top          0x{top:X}  (depth {} slots)", top.wrapping_sub(stack) / 16);
+    println!("vminfo      stack_last   0x{stack_last:X}");
+    println!("vminfo      base+0x58    0x{base:X}  (VMValue-encoded)");
+    println!("vminfo      stacksize    0x{stacksize:X}  (VMValue-encoded)");
+    println!("vminfo      global       {}", module_hit(modules, global));
+    println!("vminfo      base_ci      0x{base_ci:X}  ci 0x{ci:X}  end_ci 0x{end_ci:X}  size_ci {size_ci}");
+
+    let sane = stack < top && top <= stack_last && global > 0x10000 && ci >= base_ci && ci < end_ci;
+    println!("vminfo      sanity       {}", if sane { "consistent" } else { "INCONSISTENT" });
+
+    if global > 0x10000 {
+        let mainthread = read_u64(handle, global + G_U64_MAINTHREAD);
+        let threshold = read_u64(handle, global + G_U64_GC_THRESHOLD);
+        let total = read_u64(handle, global + G_U64_TOTALBYTES);
+        let pcall = read_u64(handle, global + G_U64_BUILTIN_PCALL);
+        let xpcall = read_u64(handle, global + G_U64_BUILTIN_XPCALL);
+        println!("vminfo      mainthread   {}", module_hit(modules, mainthread));
+        println!("vminfo      gc           total {total} threshold {threshold}");
+        let keys = [
+            read_u64(handle, global + G_U64_PTRENCKEY),
+            read_u64(handle, global + G_U64_PTRENCKEY + 8),
+            read_u64(handle, global + G_U64_PTRENCKEY + 16),
+            read_u64(handle, global + G_U64_PTRENCKEY + 24),
+        ];
+        println!(
+            "vminfo      ptrenckey    {:016X} {:016X} {:016X} {:016X}",
+            keys[0], keys[1], keys[2], keys[3]
+        );
+        describe_closure(handle, modules, "builtinPcall", pcall);
+        describe_closure(handle, modules, "builtinXpcall", xpcall);
+    }
+
+    // Frame walk: CallInfo is a contiguous array, so `previous` is `ci - 0x30`
+    // and the walk stops at base_ci.
+    let mut frame = ci;
+    for depth in 0..10 {
+        if frame < base_ci || frame >= end_ci || frame == 0 {
+            break;
+        }
+        let func = read_u64(handle, frame + CI_U64_FUNC);
+        let func_value = read_u64(handle, func + TVAL_U64_VALUE);
+        let func_tt = read_i32_at(handle, func + TVAL_I32_TT).unwrap_or(-1);
+        let proto = read_u64(handle, frame + CI_U64_PROTO);
+        let savedpc = read_u64(handle, frame + CI_U64_SAVEDPC);
+        let code = read_u64(handle, proto + PROTO_U64_CODE);
+        let insn = if savedpc >= code && code > 0x10000 {
+            ((savedpc - code) / 4) as i64
+        } else {
+            -1
+        };
+        let klass = if func_tt == LUA_TFUNCTION {
+            let is_c = read_u8_at(handle, func_value + CLOSURE_U8_IS_C).unwrap_or(0xff);
+            if is_c == 1 {
+                format!("C fn {}", module_hit(modules, read_u64(handle, func_value + CLOSURE_U64_F)))
+            } else {
+                format!("Lua closure 0x{func_value:X}")
+            }
+        } else {
+            format!("tt {func_tt} value 0x{func_value:X}")
+        };
+        println!(
+            "vminfo      frame[{depth}] ci 0x{frame:X} nresults {} flags 0x{:X} {klass} proto {} insn {insn}",
+            read_i32_at(handle, frame + CI_I32_NRESULTS).unwrap_or(0),
+            read_u32_at(handle, frame + CI_U32_FLAGS).unwrap_or(0),
+            module_hit(modules, proto),
+        );
+        let _ = read_u64(handle, frame + CI_U64_BASE);
+        let _ = read_u64(handle, frame + CI_U64_TOP);
+        frame = frame.wrapping_sub(CALLINFO_STRIDE);
+    }
+
+    // Every Roblox lua_State owns a RobloxExtraSpace that links into the
+    // Shared thread list: state -> extra -> shared_ptr<Shared> -> allThreads.
+    let extra_shared_ptr = read_u64(handle, userdata + EXTRA_U64_SHARED);
+    if extra_shared_ptr > 0x10000 {
+        let shared = extra_shared_ptr;
+        let count = read_u64(handle, shared + SHARED_U64_COUNT);
+        let head = read_u64(handle, shared + SHARED_U64_HEAD);
+        let thread_count = read_i32_at(handle, shared + SHARED_I32_THREADCOUNT).unwrap_or(0);
+        let script_context = read_u64(handle, shared + SHARED_U64_SCRIPT_CONTEXT);
+        println!(
+            "vminfo      shared       0x{shared:X} threads {count}/{thread_count} head 0x{head:X} scriptContext {}",
+            module_hit(modules, script_context)
+        );
+        let delta = userdata.wrapping_sub(state);
+        let mut entry = head;
+        let mut seen = 0u64;
+        while entry > 0x10000 && seen < 64 && seen < thread_count.max(1) as u64 {
+            let sibling = entry.wrapping_sub(delta);
+            let sibling_tt = read_u8_at(handle, sibling + LUA_U8_TT).unwrap_or(0xff);
+            let sibling_global = read_u64(handle, sibling + LUA_U64_GLOBAL);
+            let looks_like_state =
+                sibling_tt == LUA_TTHREAD && sibling_global == global && sibling_global > 0x10000;
+            println!(
+                "vminfo      thread[{seen}] extra 0x{entry:X} -> state 0x{sibling:X} {}",
+                if looks_like_state { "ok" } else { "not a state" }
+            );
+            let next = read_u64(handle, entry);
+            if next == 0 || next == head {
+                break;
+            }
+            entry = next;
+            seen += 1;
+        }
+    }
+}
+
+fn vm_info(pid: u32, state: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    describe_state(handle, &modules, state);
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Calls one client function once from a hijacked thread and puts the thread
+/// back exactly where it was.
+///
+/// Only data is written: a scratch stack plus four register values. No code
+/// bytes are touched and no new executable region appears, which is the only
+/// shape that has survived the client's integrity watch so far. The return
+/// address lands on an `EB FE` pad, so the thread parks in a spin instead of
+/// running off the end of the scratch stack.
+fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Result<u64, String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let Some(client) = modules.iter().find(|module| module.name.eq_ignore_ascii_case(EXE))
+    else {
+        unsafe { CloseHandle(handle) };
+        return Err("client module not found".into());
+    };
+    let target = client.base + target_rva;
+    let park = client.base + PARK_RVA;
+    match read_bytes(handle, park, 2) {
+        Some(bytes) if bytes == [0xEB, 0xFE] => {}
+        other => {
+            unsafe { CloseHandle(handle) };
+            return Err(format!("park pad at {PARK_RVA:#X} is not EB FE: {other:?}"));
+        }
+    }
+
+    let scratch = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x2000, MEM_COMMIT_RESERVE, 0x04)
+    };
+    if scratch.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("scratch allocation failed".into());
+    }
+    let stack_top = scratch as u64 + 0x2000 - 0x10;
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            handle,
+            (stack_top - 8) as *mut c_void,
+            &park as *const u64 as *const c_void,
+            8,
+            &mut written,
+        )
+    };
+    println!(
+        "xcall       target {} (rva 0x{target_rva:X}) park {} scratch 0x{:X}",
+        module_hit(&modules, target),
+        module_hit(&modules, park),
+        scratch as u64
+    );
+    println!(
+        "xcall       rcx 0x{:X} rdx 0x{:X} r8 0x{:X} r9 0x{:X}",
+        args[0], args[1], args[2], args[3]
+    );
+
+    let mut ordered: Vec<(u8, u32)> = threads_of(pid)
+        .into_iter()
+        .take(64)
+        .map(|id| {
+            (
+                thread_rip(handle, id)
+                    .map(|rip| hijack_rank(rip, &modules))
+                    .unwrap_or(3),
+                id,
+            )
+        })
+        .collect();
+    ordered.sort_by_key(|entry| entry.0);
+
+    let mut chosen: Option<(u32, Handle, Vec<u8>)> = None;
+    for (rank, id) in ordered {
+        if rank > 2 {
+            break;
+        }
+        let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+        if thread.is_null() {
+            continue;
+        }
+        unsafe { SuspendThread(thread) };
+        let mut original = vec![0u8; CONTEXT_SIZE];
+        unsafe {
+            *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+        }
+        if unsafe { GetThreadContext(thread, original.as_mut_ptr() as *mut c_void) } == 0 {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            };
+            continue;
+        }
+        let mut patched = original.clone();
+        unsafe {
+            // CONTEXT layout: RAX 0x78, RCX 0x80, RDX 0x88, RBX 0x90, RSP 0x98,
+            // R8 0xB8, R9 0xC0, RIP 0xF8. RBX stays untouched so nothing that
+            // peeks at it before writing sees a foreign pointer.
+            *(patched.as_mut_ptr().add(0xF8) as *mut u64) = target;
+            *(patched.as_mut_ptr().add(0x98) as *mut u64) = stack_top - 8;
+            *(patched.as_mut_ptr().add(0x78) as *mut u64) = 0;
+            *(patched.as_mut_ptr().add(0x80) as *mut u64) = args[0];
+            *(patched.as_mut_ptr().add(0x88) as *mut u64) = args[1];
+            *(patched.as_mut_ptr().add(0xB8) as *mut u64) = args[2];
+            *(patched.as_mut_ptr().add(0xC0) as *mut u64) = args[3];
+        }
+        if unsafe { SetThreadContext(thread, patched.as_ptr() as *const c_void) } == 0 {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            };
+            continue;
+        }
+        unsafe { ResumeThread(thread) };
+        chosen = Some((id, thread, original));
+        break;
+    }
+
+    let Some((id, thread, original)) = chosen else {
+        unsafe { CloseHandle(handle) };
+        return Err("no thread available".into());
+    };
+    println!("xcall       thread {id} dispatched");
+
+    // Poll for the park pad. RSP is the tell: the callee pushed a frame, so a
+    // thread still inside it sits below `stack_top`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let mut parked = false;
+    while std::time::Instant::now() < deadline {
+        unsafe { SuspendThread(thread) };
+        let mut probe = vec![0u8; CONTEXT_SIZE];
+        unsafe {
+            *(probe.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+        }
+        let ok = unsafe { GetThreadContext(thread, probe.as_mut_ptr() as *mut c_void) } != 0;
+        let rip = unsafe { *(probe.as_ptr().add(0xF8) as *const u64) };
+        let rsp = unsafe { *(probe.as_ptr().add(0x98) as *const u64) };
+        let rax = unsafe { *(probe.as_ptr().add(0x78) as *const u64) };
+        unsafe { ResumeThread(thread) };
+        if ok && rip == park && rsp == stack_top {
+            parked = true;
+            println!("xcall       parked, rax 0x{rax:X} ({})", module_hit(&modules, rax));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    if !parked {
+        unsafe {
+            CloseHandle(thread);
+            CloseHandle(handle);
+        }
+        return Err("thread never reached the park pad; left it untouched".into());
+    }
+
+    unsafe {
+        SuspendThread(thread);
+        SetThreadContext(thread, original.as_ptr() as *const c_void);
+        ResumeThread(thread);
+        CloseHandle(thread);
+        CloseHandle(handle);
+    }
+    println!("xcall       thread {id} restored");
+    Ok(park)
 }
 
 fn image_test(
@@ -2157,6 +2701,9 @@ fn main() -> Result<(), String> {
     let mut patch: Option<(u32, bool)> = None;
     let mut oracle_pid: Option<u32> = None;
     let mut sampler: Option<(u32, u32, u64)> = None;
+    let mut dump: Option<(u32, u64, usize)> = None;
+    let mut vminfo: Option<u64> = None;
+    let mut xcall: Option<(u64, [u64; 4], u64)> = None;
     let mut carrier: Option<String> = None;
     let mut use_existing = false;
     let mut mode: u64 = 1;
@@ -2203,8 +2750,25 @@ fn main() -> Result<(), String> {
                     None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
                 });
             }
-            "--sample" => {
-                let value = argv.next().ok_or("--sample needs an rva")?;
+            "--dump" => {
+                let value = argv.next().ok_or("--dump needs an address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let length = match argv.next() {
+                    Some(text) => usize::from_str_radix(text.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad length {text}"))?,
+                    None => 0x80,
+                };
+                dump = Some((
+                    match pid {
+                        Some(value) => value,
+                        None => find_pid(EXE).ok_or_else(|| format!("{EXE} is not running"))?,
+                    },
+                    address,
+                    length,
+                ));
+            }
+            "--sample" => {                let value = argv.next().ok_or("--sample needs an rva")?;
                 let rva = u32::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad rva {value}"))?;
                 let span = match argv.next() {
@@ -2220,6 +2784,31 @@ fn main() -> Result<(), String> {
                     rva,
                     span,
                 ));
+            }
+            "--vminfo" => {
+                let value = argv.next().ok_or("--vminfo needs a lua_State address")?;
+                vminfo = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--xcall" => {
+                let value = argv.next().ok_or("--xcall needs an rva")?;
+                let rva = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad rva {value}"))?;
+                let mut call_args = [0u64; 4];
+                for slot in call_args.iter_mut() {
+                    let text = argv.next().ok_or("--xcall needs four hex arguments")?;
+                    *slot = u64::from_str_radix(text.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad argument {text}"))?;
+                }
+                let wait_ms = match argv.next() {
+                    Some(text) => text
+                        .parse::<u64>()
+                        .map_err(|_| format!("bad wait {text}"))?,
+                    None => 8000,
+                };
+                xcall = Some((rva, call_args, wait_ms));
             }
             "--oracle" => {                oracle_pid = Some(match pid {
                     Some(value) => value,
@@ -2270,6 +2859,22 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
+
+    if let Some(state) = vminfo {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return vm_info(target, state);
+    }
+
+    if let Some((rva, call_args, wait_ms)) = xcall {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let park = remote_call(target, rva, call_args, wait_ms)?;
+        println!("xcall       done, park pad 0x{park:X}");
+        return Ok(());
+    }
+
+    if let Some((target, address, length)) = dump {
+        return dump_memory(target, address, length);
+    }
 
     if let Some((target, rva, span)) = sampler {
         return sample_state(target, rva, span, 30);
