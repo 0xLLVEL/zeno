@@ -5,11 +5,11 @@
 
 #include "lua.h"
 #include "lualib.h"
-#include "lauxlib.h"
 #include "luacode.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -316,7 +316,13 @@ bool Executor::init() {
     luaL_openlibs(d->L);
     install_api(d->L);
 
-    if (luaL_loadbuffer(d->L, kPrelude, strlen(kPrelude), "=zeno_prelude") != LUA_OK) {
+    size_t prelude_size = 0;
+    char* prelude_bc = luau_compile(kPrelude, strlen(kPrelude), nullptr, &prelude_size);
+    int prelude_status =
+        prelude_bc ? luau_load(d->L, "=zeno_prelude", prelude_bc, prelude_size, 0) : LUA_ERRSYNTAX;
+    free(prelude_bc);
+
+    if (prelude_status != LUA_OK) {
         bridge::out_err(lua_tostring(d->L, -1));
         lua_pop(d->L, 1);
     } else if (lua_pcall(d->L, 0, 0, 0) != LUA_OK) {
@@ -391,7 +397,7 @@ void Executor::run_script(const std::string& source) {
     }
 
     lua_State* co = lua_newthread(d->L);
-    int ref = luaL_ref(d->L, LUA_REGISTRYINDEX);
+    int ref = lua_ref(d->L, -1);
 
     int status = luau_load(co, "=zeno", bc, bc_size, 0);
     free(bc);
@@ -400,7 +406,7 @@ void Executor::run_script(const std::string& source) {
         const char* err = lua_tostring(co, -1);
         bridge::out_err(err ? err : "compile error");
         lua_settop(co, 0);
-        luaL_unref(d->L, LUA_REGISTRYINDEX, ref);
+        lua_unref(d->L, ref);
         return;
     }
 
@@ -418,7 +424,7 @@ int Executor::spawn_from(lua_State* caller, long long delay_ms) {
     if (nvals < 1 || !lua_isfunction(caller, 1)) return -1;
 
     lua_State* co = lua_newthread(caller);       // pushes the thread
-    const int ref = luaL_ref(caller, LUA_REGISTRYINDEX); // pops it
+    const int ref = lua_ref(caller, -1); // pops it
     lua_xmove(caller, co, nvals);                // fn + args land on co
 
     schedule(ref, delay_ms, nvals - 1);
@@ -455,7 +461,7 @@ void Executor::settle(int status, lua_State* co, int ref, const char* chunk) {
     }
 
     lua_settop(co, 0);
-    luaL_unref(d->L, LUA_REGISTRYINDEX, ref);
+    lua_unref(d->L, ref);
     (void)chunk;
 }
 
