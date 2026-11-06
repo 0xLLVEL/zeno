@@ -77,22 +77,117 @@ struct ThreadEntry32 {
     dw_flags: u32,
 }
 
+#[repr(C)]
+struct ModuleEntry32 {
+    dw_size: u32,
+    th32_module_id: u32,
+    th32_process_id: u32,
+    glblcnt_usage: u32,
+    proccnt_usage: u32,
+    _pad: u32,
+    mod_base: *mut u8,
+    mod_base_size: u32,
+    _pad2: u32,
+    h_module: *mut c_void,
+    sz_module: [u8; 256],
+    sz_exe_path: [u8; 260],
+}
+
 const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const TH32CS_SNAPMODULE: u32 = 0x0000_0008 | 0x0000_0010;
 const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
 const CONTEXT_FULL: u32 = 0x0010_000B;
 const CONTEXT_SIZE: usize = 0x4D0;
 const CONTEXT_FLAGS_OFFSET: usize = 0x30;
+const CONTEXT_RIP_OFFSET: usize = 0xF8;
 
 #[link(name = "kernel32")]
 extern "system" {
     fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
     fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn Module32FirstW(snapshot: Handle, entry: *mut ModuleEntry32) -> i32;
+    fn Module32NextW(snapshot: Handle, entry: *mut ModuleEntry32) -> i32;
     fn OpenThread(access: u32, inherit: i32, id: u32) -> Handle;
     fn SuspendThread(thread: Handle) -> u32;
     fn ResumeThread(thread: Handle) -> u32;
     fn GetThreadContext(thread: Handle, context: *mut c_void) -> i32;
     fn SetThreadContext(thread: Handle, context: *const c_void) -> i32;
+}
+
+struct Module {
+    name: String,
+    base: u64,
+    size: u64,
+}
+
+fn modules_of(pid: u32) -> Vec<Module> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) };
+    if snapshot.is_null() || snapshot == -1isize as Handle {
+        return Vec::new();
+    }
+    let mut entry: ModuleEntry32 = unsafe { std::mem::zeroed() };
+    entry.dw_size = std::mem::size_of::<ModuleEntry32>() as u32;
+
+    let mut out = Vec::new();
+    let mut ok = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        let end = entry.sz_module.iter().position(|b| *b == 0).unwrap_or(256);
+        let name = String::from_utf8_lossy(&entry.sz_module[..end]).to_lowercase();
+        out.push(Module {
+            name,
+            base: entry.mod_base as u64,
+            size: entry.mod_base_size as u64,
+        });
+        ok = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    out
+}
+
+/// Where a thread is parked. A thread that is sitting inside a wait is the
+/// safest thing to hijack: it holds no Roblox allocator lock, so the payload
+/// can call `malloc` without deadlocking the client. Threads caught inside the
+/// game module are the opposite and are tried last.
+fn thread_rip(handle: Handle, id: u32) -> Option<u64> {
+    let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+    if thread.is_null() {
+        return None;
+    }
+    unsafe { SuspendThread(thread) };
+    let mut context = vec![0u8; CONTEXT_SIZE];
+    unsafe { *(context.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+    let ok = unsafe { GetThreadContext(thread, context.as_mut_ptr() as *mut c_void) } != 0;
+    unsafe {
+        ResumeThread(thread);
+        CloseHandle(thread);
+    }
+    if !ok {
+        return None;
+    }
+    Some(unsafe { *(context.as_ptr().add(CONTEXT_RIP_OFFSET) as *const u64) })
+}
+
+fn hijack_rank(rip: u64, modules: &[Module]) -> u8 {
+    for module in modules {
+        if rip >= module.base && rip < module.base + module.size {
+            if module.name.ends_with(".exe") {
+                return 2;
+            }
+            if module.name.starts_with("ntdll")
+                || module.name.starts_with("kernelbase")
+                || module.name.starts_with("win32u")
+                || module.name.starts_with("user32")
+                || module.name.starts_with("kernel32")
+                || module.name.starts_with("msvcrt")
+                || module.name.starts_with("ucrtbase")
+            {
+                return 0;
+            }
+            return 1;
+        }
+    }
+    1
 }
 
 fn threads_of(pid: u32) -> Vec<u32> {
@@ -132,9 +227,23 @@ fn read_u64(handle: Handle, address: u64) -> u64 {
 
 /// Point a suspended thread at `stub`, wait for it to publish a result at
 /// `marker`, then put the thread back exactly where it was.
-fn run_stub(handle: Handle, threads: &[u32], stub: u64, marker: u64) -> Option<(u32, u64)> {
+fn run_stub(
+    handle: Handle,
+    threads: &[u32],
+    modules: &[Module],
+    stub: u64,
+    marker: u64,
+) -> Option<(u32, u64)> {
+    let mut ordered: Vec<(u8, u32)> = threads
+        .iter()
+        .take(64)
+        .map(|id| (thread_rip(handle, *id).map(|rip| hijack_rank(rip, modules)).unwrap_or(3), *id))
+        .collect();
+    ordered.sort_by_key(|entry| entry.0);
+    let ranked: Vec<u32> = ordered.into_iter().map(|entry| entry.1).collect();
+
     let mut stuck = 0usize;
-    for id in threads.iter().take(24) {
+    for id in ranked.iter().take(24) {
         let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, *id) };
         if thread.is_null() {
             continue;
@@ -528,8 +637,9 @@ fn main() -> Result<(), String> {
         }
 
         let list = threads_of(pid);
-        println!("target      pid {pid}, {} threads", list.len());
-        let result = run_stub(handle, &list, stub_block as u64, marker);
+        let modules = modules_of(pid);
+        println!("target      pid {pid}, {} threads, {} modules", list.len(), modules.len());
+        let result = run_stub(handle, &list, &modules, stub_block as u64, marker);
 
         unsafe {
             VirtualFreeEx(handle, stub_block, 0, 0x8000);
@@ -563,7 +673,8 @@ fn main() -> Result<(), String> {
         }
 
         let list = threads_of(pid);
-        println!("target      pid {pid}, {} threads", list.len());
+        let modules = modules_of(pid);
+        println!("target      pid {pid}, {} threads, {} modules", list.len(), modules.len());
         if list.is_empty() {
             unsafe { CloseHandle(handle) };
             return Err("no threads to hijack".into());
@@ -666,7 +777,7 @@ fn main() -> Result<(), String> {
         println!("stub        0x{stub:X} -> func 0x{func:X}, marker 0x{marker:X}");
 
         let mut success = false;
-        if let Some((id, value)) = run_stub(handle, &list, stub, marker) {
+        if let Some((id, value)) = run_stub(handle, &list, &modules, stub, marker) {
             println!("hijack      thread {id} ran the stub, result 0x{value:X}");
             success = true;
         }
