@@ -136,30 +136,7 @@ impl Process {
 
     /// Base address and size of a loaded module.
     pub fn module(&self, module_name: &str) -> Option<(u64, u32, String)> {
-        let snapshot =
-            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, self.pid) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return None;
-        }
-
-        let mut entry: ModuleEntry32W = unsafe { std::mem::zeroed() };
-        entry.dw_size = std::mem::size_of::<ModuleEntry32W>() as u32;
-
-        let mut result = None;
-        let mut ok = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
-        while ok {
-            if wide_to_string(&entry.sz_module).eq_ignore_ascii_case(module_name) {
-                result = Some((
-                    entry.mod_base_addr as u64,
-                    entry.mod_base_size,
-                    wide_to_string(&entry.sz_exe_path),
-                ));
-                break;
-            }
-            ok = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
-        }
-        unsafe { CloseHandle(snapshot) };
-        result
+        module_info(self.pid, module_name)
     }
 
     /// Section bytes read out of the live mapping.
@@ -246,6 +223,55 @@ pub fn probe_access(pid: u32) -> Vec<(u32, &'static str, bool, u32)> {
         results.push((mask, name, opened, error));
     }
     results
+}
+
+/// Base, size and on-disk path of a module loaded in `pid`.
+pub fn module_info(pid: u32, module_name: &str) -> Option<(u64, u32, String)> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entry: ModuleEntry32W = unsafe { std::mem::zeroed() };
+    entry.dw_size = std::mem::size_of::<ModuleEntry32W>() as u32;
+
+    let mut result = None;
+    let mut ok = unsafe { Module32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        if wide_to_string(&entry.sz_module).eq_ignore_ascii_case(module_name) {
+            result = Some((
+                entry.mod_base_addr as u64,
+                entry.mod_base_size,
+                wide_to_string(&entry.sz_exe_path),
+            ));
+            break;
+        }
+        ok = unsafe { Module32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    result
+}
+
+/// Newest live process whose executable name matches, case-insensitively.
+pub fn find_pid(exe_name: &str) -> Option<u32> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+
+    let mut found = None;
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        if wide_to_string(&entry.sz_exe_file).eq_ignore_ascii_case(exe_name) {
+            found = Some(entry.th32_process_id);
+        }
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    found
 }
 
 pub fn probe_modules(pid: u32) -> Result<(usize, Vec<String>), u32> {

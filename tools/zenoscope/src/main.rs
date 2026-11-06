@@ -6,6 +6,7 @@
 //!     client — its `.text` is encrypted on disk)
 //!   * the file on disk (fallback, and how the tool is exercised in tests)
 
+mod dump;
 mod hpp;
 mod image;
 mod live;
@@ -24,13 +25,6 @@ const CLIENT_MODULE: &str = "RobloxPlayerBeta.exe";
 const SCHEDULER_MESSAGE: &str = "Default job arbiter must always be valid";
 const RTTI_TARGETS: [&str; 2] = [".?AVDataModel@RBX@@", ".?AVVisualEngine@Graphics@RBX@@"];
 
-const PROLOGUES: [&[u8]; 4] = [
-    &[0x48, 0x89, 0x5C, 0x24],
-    &[0x48, 0x83, 0xEC],
-    &[0xCC, 0xCC, 0xCC, 0xCC],
-    &[0x00, 0x00, 0x00, 0x00],
-];
-
 struct Args {
     exe: Option<PathBuf>,
     pid: Option<u32>,
@@ -38,6 +32,13 @@ struct Args {
     verify: Option<PathBuf>,
     module: Option<String>,
     json: Option<PathBuf>,
+    dump: bool,
+    force: bool,
+    rebuild: bool,
+    out: Option<PathBuf>,
+    inspect: Option<usize>,
+    watch: Option<u64>,
+    base: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +49,13 @@ fn parse_args() -> Result<Args, String> {
         verify: None,
         module: None,
         json: None,
+        dump: false,
+        force: false,
+        rebuild: false,
+        out: None,
+        inspect: None,
+        watch: None,
+        base: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -76,10 +84,42 @@ fn parse_args() -> Result<Args, String> {
             "--verify" => {
                 args.verify = Some(PathBuf::from(argv.next().ok_or("--verify needs a path")?));
             }
+            "--dump" => args.dump = true,
+            "--force-dump" => args.force = true,
+            "--rebuild" => args.rebuild = true,
+            "--watch" => {
+                let value = argv.next().ok_or("--watch needs a duration in seconds")?;
+                args.watch = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--watch expects seconds, got {value}"))?,
+                );
+            }
+            "--base" => {
+                args.base = Some(PathBuf::from(argv.next().ok_or("--base needs a path")?));
+            }
+            "--inspect" => {
+                let value = argv.next().ok_or("--inspect needs a page count")?;
+                args.inspect = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--inspect expects a number, got {value}"))?,
+                );
+            }
+            "--out" => {
+                args.out = Some(PathBuf::from(argv.next().ok_or("--out needs a path")?));
+            }
             "-h" | "--help" => {
                 println!("zenoscope [--pid <n> | --exe <path>] [--module <name>] [--json <out>]");
                 println!("zenoscope --probe <pid>     report which access masks the target grants");
                 println!("zenoscope --verify <hpp>    check an offsets pack against this client");
+                println!("zenoscope --dump            rebuild a decrypted client image (elevated)");
+                println!("           [--pid <n>] [--module <name>] [--out <path>] [--rebuild]");
+                println!("zenoscope --inspect <n>     lift protection on n .text pages and report");
+                println!("zenoscope --force-dump      run a copy stub inside the client so its own");
+                println!("                            handler decrypts .text; visible to the anti-tamper");
+                println!("zenoscope --watch <secs>    sample .text and keep every decrypted page");
+                println!("           [--base <image>] [--out <path>]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -130,7 +170,7 @@ fn describe_error(code: u32) -> &'static str {
     }
 }
 
-fn thousands(mut n: u64) -> String {
+pub fn thousands(mut n: u64) -> String {
     if n == 0 {
         return "0".into();
     }
@@ -448,6 +488,285 @@ fn verify_pack(path: &PathBuf, image: &dyn Image, client: &str) -> Result<(), St
 }
 
 
+fn run_inspect(args: &Args, count: usize) -> Result<(), String> {
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    let probes = dump::inspect(args.pid, module, count)?;
+
+    println!("zenoscope inspect  {module}");
+    println!();
+    println!(
+        "  {:<10} {:>8} {:>6} {:>6} {:>8} {:>16} {}",
+        "rva", "protect", "lifted", "read", "equals-disk", "head", "prologue"
+    );
+    for probe in &probes {
+        println!(
+            "  0x{:<8X} {:>8} {:>6} {:>6} {:>8} {:>16} {}",
+            probe.rva,
+            format!("0x{:X}", probe.protect_before),
+            if probe.lifted { "yes" } else { "no" },
+            match (probe.read_ok, probe.error) {
+                (true, _) => "ok".to_string(),
+                (false, Some(error)) => format!("err {error}"),
+                (false, None) => "no".to_string(),
+            },
+            if probe.same_as_disk { "yes" } else { "no" },
+            probe.head,
+            probe.prologue.unwrap_or("-")
+        );
+    }
+
+    let lifted = probes.iter().filter(|p| p.lifted).count();
+    let readable = probes.iter().filter(|p| p.read_ok).count();
+    let identical = probes.iter().filter(|p| p.same_as_disk).count();
+    let code = probes.iter().filter(|p| p.prologue.is_some()).count();
+
+    println!();
+    println!("  pages        {} probed, {lifted} unprotected, {readable} read, {identical} identical to disk", probes.len());
+    println!();
+    println!(
+        "  verdict      {}",
+        if code > 0 {
+            "protection lift reveals real code — PAGE_NOACCESS is the only wall"
+        } else if readable > 0 && identical == readable {
+            "the bytes under the lifted protection are still the on-disk ciphertext"
+        } else if readable > 0 {
+            "readable under the lift but not identical to disk — inspect the head bytes"
+        } else {
+            "the protection cannot be lifted from outside"
+        }
+    );
+
+    Ok(())
+}
+
+fn run_watch(args: &Args, seconds: u64) -> Result<(), String> {
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    println!("zenoscope watch  {module}  {seconds}s");
+    let report = dump::watch(
+        args.pid,
+        module,
+        args.base.clone(),
+        seconds,
+        args.out.clone(),
+        args.rebuild,
+    )?;
+
+    println!();
+    println!("  process      pid {}", report.pid);
+    println!("  module       {}  base 0x{:X}", report.module_path, report.base);
+    for note in &report.notes {
+        println!("  note         {note}");
+    }
+    println!(
+        "  pages        {} total, {} decrypted, {} newly captured in this pass",
+        thousands(report.pages_total),
+        thousands(report.pages_readable),
+        thousands(report.new_pages)
+    );
+
+    println!();
+    println!("  prologues");
+    for (index, label) in ["48 89 5C 24", "48 83 EC   ", "int3 pad   ", "zeros      "]
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "    {label} {:>10} -> {}",
+            thousands(report.prologues_before[index] as u64),
+            thousands(report.prologues_after[index] as u64)
+        );
+    }
+
+    let coverage = if report.pages_total == 0 {
+        0.0
+    } else {
+        report.pages_readable as f64 * 100.0 / report.pages_total as f64
+    };
+    println!();
+    println!("  coverage     {coverage:.1}% of .text captured");
+    println!(
+        "  wrote        {} ({} bytes)",
+        report.output.display(),
+        thousands(report.output_bytes)
+    );
+    if let Some(rebuilt) = &report.rebuilt {
+        let bytes = std::fs::metadata(rebuilt).map(|m| m.len()).unwrap_or(0);
+        println!("  rebuilt      {} ({} bytes)", rebuilt.display(), thousands(bytes));
+    }
+
+    Ok(())
+}
+
+fn run_force(args: &Args) -> Result<(), String> {
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    let report = dump::force(args.pid, module, args.out.clone())?;
+
+    println!("zenoscope force-dump");
+    println!("  process      pid {}", report.pid);
+    println!("  module       {}  base 0x{:X}", report.module_path, report.base);
+    for note in &report.notes {
+        println!("  note         {note}");
+    }
+
+    println!();
+    println!("  {:<12} {:>12} {:>6} {:>8} {:>10} {:>12}", "rva", "bytes", "ran", "wait", "changed", "exit");
+    for chunk in &report.chunks {
+        println!(
+            "  0x{:<10X} {:>12} {:>6} {:>8} {:>10} {:>12}",
+            chunk.rva,
+            thousands(chunk.len),
+            if chunk.ran { "yes" } else { "NO" },
+            format!("0x{:X}", chunk.waited),
+            thousands(chunk.changed_bytes),
+            format!("0x{:08X}", chunk.exit_code)
+        );
+    }
+
+    let captured: u64 = report.chunks.iter().map(|c| c.len).sum();
+    let changed: u64 = report.chunks.iter().map(|c| c.changed_bytes).sum();
+    let finished = report.chunks.iter().filter(|c| c.ran).count();
+
+    println!();
+    println!("  chunks       {}/{} completed", finished, report.chunks.len());
+    println!("  captured     {} bytes, {} differed from disk", thousands(captured), thousands(changed));
+
+    println!();
+    println!("  prologues");
+    for (index, label) in ["48 89 5C 24", "48 83 EC   ", "int3 pad   ", "zeros      "]
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "    {label} {:>10} -> {}",
+            thousands(report.prologues_before[index] as u64),
+            thousands(report.prologues_after[index] as u64)
+        );
+    }
+
+    println!();
+    println!(
+        "  verdict      {}",
+        if report.prologues_after[0] > 5000 {
+            "the client decrypted on read; .text is in the clear"
+        } else if report.prologues_after[0] > report.prologues_before[0] {
+            "some pages decrypted, the read fault is handled only part of the way"
+        } else {
+            "no new pages — the fault did not reach the client's handler"
+        }
+    );
+    println!(
+        "  wrote        {} ({} bytes)",
+        report.output.display(),
+        thousands(report.output_bytes)
+    );
+
+    Ok(())
+}
+
+fn run_dump(args: &Args) -> Result<(), String> {
+    let module = args.module.as_deref().unwrap_or(CLIENT_MODULE);
+    let report = dump::dump(args.pid, module, args.out.clone(), args.rebuild)?;
+
+    println!("zenoscope dump");
+    println!("  process      pid {}", report.pid);
+    println!(
+        "  module       {}  base 0x{:X}  size 0x{:X}",
+        report.module_path, report.base, report.size
+    );
+    println!("  on disk      {} bytes", thousands(report.image_bytes));
+    for note in &report.notes {
+        println!("  note         {note}");
+    }
+
+    println!();
+    println!(
+        "  {:<10} {:>10} {:>8} {:>8} {:>10} {:>5}",
+        "section", "span", "flushed", "read", "changed", "exec"
+    );
+    for section in &report.sections {
+        println!(
+            "  {:<10} {:>10} {:>8} {:>8} {:>10} {:>5}",
+            section.name,
+            thousands(section.span),
+            thousands(section.flushed),
+            thousands(section.read),
+            thousands(section.changed_bytes),
+            if section.runtime_executable { "x" } else { "-" }
+        );
+        if section.unreadable > 0 {
+            println!(
+                "             {} pages refused by the kernel (first error {})",
+                thousands(section.unreadable),
+                section
+                    .first_read_error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "?".into())
+            );
+            for (key, count) in &section.denied_protect {
+                let protect = key & 0xFF;
+                let state = key >> 16;
+                println!(
+                    "             {} pages state 0x{:X} protect 0x{:X}",
+                    thousands(*count),
+                    state,
+                    protect
+                );
+            }
+        }
+        if section.flush_errors > 0 {
+            println!(
+                "             {} flush calls failed, first status 0x{:X}",
+                thousands(section.flush_errors),
+                section.first_flush_status.unwrap_or(0) as u32
+            );
+        }
+    }
+
+    let (flushed, read, unreadable, changed) = report.totals();
+    println!();
+    println!("  pages        {} flushed, {} read, {} refused", thousands(flushed), thousands(read), thousands(unreadable));
+    println!("  bytes        {} replaced with live contents", thousands(changed));
+
+    println!();
+    println!("  prologues");
+    for (index, label) in [
+        "48 89 5C 24",
+        "48 83 EC   ",
+        "int3 pad   ",
+        "zeros      ",
+    ]
+    .iter()
+    .enumerate()
+    {
+        println!(
+            "    {label} {:>10} -> {}",
+            thousands(report.prologues_before[index] as u64),
+            thousands(report.prologues_after[index] as u64)
+        );
+    }
+
+    let code_before = report.prologues_before[0];
+    let code_after = report.prologues_after[0];
+    println!();
+    println!(
+        "  verdict      {}",
+        if code_after > 100 {
+            "code pages decrypted; the dump is analysable"
+        } else if code_after > code_before {
+            "partial decrypt — some pages stayed encrypted"
+        } else {
+            "nothing decrypted — the flush no longer forces a fault"
+        }
+    );
+    println!("  wrote        {} ({} bytes)", report.output.display(), thousands(report.output_bytes));
+    if let Some(rebuilt) = &report.rebuilt {
+        let bytes = std::fs::metadata(rebuilt).map(|m| m.len()).unwrap_or(0);
+        println!("  rebuilt      {} ({} bytes)", rebuilt.display(), thousands(bytes));
+    }
+
+    Ok(())
+}
+
 fn main() {
     if let Err(message) = run() {
         eprintln!("zenoscope: {message}");
@@ -457,6 +776,22 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+
+    if args.dump {
+        return run_dump(&args);
+    }
+
+    if args.force {
+        return run_force(&args);
+    }
+
+    if let Some(seconds) = args.watch {
+        return run_watch(&args, seconds);
+    }
+
+    if let Some(count) = args.inspect {
+        return run_inspect(&args, count);
+    }
 
     if let Some(pid) = args.probe {
         println!("zenoscope probe  pid {pid}");
@@ -534,7 +869,7 @@ fn run() -> Result<(), String> {
     }
 
     let refs = scan_rip_refs(image);
-    let counts = scan::count_patterns(image, &PROLOGUES);
+    let counts = scan::count_patterns(image, &scan::PROLOGUES);
     let leas = refs.iter().filter(|r| r.kind == scan::RefKind::Lea).count();
     let movs = refs.len() - leas;
     let packed = counts[0] == 0 && counts[1] < 100;

@@ -12,6 +12,15 @@
 
 use crate::image::Image;
 
+/// Byte patterns a real MSVC x64 code section is full of. Used to tell a
+/// decrypted image from a packed one.
+pub const PROLOGUES: [&[u8]; 4] = [
+    &[0x48, 0x89, 0x5C, 0x24],
+    &[0x48, 0x83, 0xEC],
+    &[0xCC, 0xCC, 0xCC, 0xCC],
+    &[0x00, 0x00, 0x00, 0x00],
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {
     Lea,
