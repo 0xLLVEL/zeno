@@ -111,23 +111,91 @@ pub fn list_imports(file: &[u8]) -> Result<Vec<(String, Vec<String>)>, String> {
     Ok(out)
 }
 
+/// One entry of the import address table: where it lives in the mapped image
+/// and what has to be written there.
+pub struct Import {
+    pub library: String,
+    pub name: Option<String>,
+    pub ordinal: u16,
+    pub iat_rva: u32,
+}
+
+/// Every IAT slot the image expects the loader to fill.
+pub fn import_table(file: &[u8]) -> Result<Vec<Import>, String> {
+    let sections = sections(file)?;
+    let pe = u32_at(file, 0x3C).ok_or("truncated DOS header")? as usize;
+    let optional = pe + 24;
+    let import_rva = u32_at(file, optional + 112 + 8).ok_or("truncated data directory")?;
+    if import_rva == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut entry = rva_to_offset(&sections, import_rva).ok_or("import directory outside file")?;
+    loop {
+        let original = u32_at(file, entry).ok_or("truncated import descriptor")?;
+        let name_rva = u32_at(file, entry + 12).ok_or("truncated import descriptor")?;
+        let first_thunk = u32_at(file, entry + 16).ok_or("truncated import descriptor")?;
+        if original == 0 && name_rva == 0 && first_thunk == 0 {
+            break;
+        }
+        let library = cstr_in(file, rva_to_offset(&sections, name_rva).ok_or("bad library name")?);
+        let thunks = rva_to_offset(&sections, if original != 0 { original } else { first_thunk })
+            .ok_or("thunks outside file")?;
+
+        let mut index = 0usize;
+        loop {
+            let thunk = match u64_at(file, thunks + index * 8) {
+                Some(value) => value,
+                None => break,
+            };
+            if thunk == 0 {
+                break;
+            }
+            let iat_rva = first_thunk + (index as u32) * 8;
+            if thunk & 0x8000_0000_0000_0000 != 0 {
+                out.push(Import {
+                    library: library.clone(),
+                    name: None,
+                    ordinal: (thunk & 0xFFFF) as u16,
+                    iat_rva,
+                });
+            } else {
+                let hint = rva_to_offset(&sections, (thunk as u32) & 0x7FFF_FFFF)
+                    .ok_or("hint/name outside file")?;
+                out.push(Import {
+                    library: library.clone(),
+                    name: Some(cstr_in(file, hint + 2)),
+                    ordinal: 0,
+                    iat_rva,
+                });
+            }
+            index += 1;
+        }
+        entry += 20;
+    }
+    Ok(out)
+}
+
 /// RVA of a named export, read from the image's own export directory.
 pub fn export_rva(image: &[u8], name: &str) -> Option<u32> {
+    let sections = sections(image).ok()?;
     let pe = u32_at(image, 0x3C)? as usize;
     let optional = pe + 24;
     let export_rva = u32_at(image, optional + 112)?;
     if export_rva == 0 {
         return None;
     }
-    let dir = export_rva as usize;
+    // Everything below is an RVA, and RVAs are file offsets only by accident.
+    let dir = rva_to_offset(&sections, export_rva)?;
     let count = u32_at(image, dir + 24)? as usize;
-    let functions = u32_at(image, dir + 28)? as usize;
-    let names = u32_at(image, dir + 32)? as usize;
-    let ordinals = u32_at(image, dir + 36)? as usize;
+    let functions = rva_to_offset(&sections, u32_at(image, dir + 28)?)?;
+    let names = rva_to_offset(&sections, u32_at(image, dir + 32)?)?;
+    let ordinals = rva_to_offset(&sections, u32_at(image, dir + 36)?)?;
 
     for index in 0..count {
-        let name_rva = u32_at(image, names + index * 4)? as usize;
-        let candidate = cstr_in(image, name_rva);
+        let name_rva = u32_at(image, names + index * 4)?;
+        let candidate = cstr_in(image, rva_to_offset(&sections, name_rva)?);
         if candidate == name {
             let ordinal = u16_at(image, ordinals + index * 2)? as usize;
             return u32_at(image, functions + ordinal * 4);

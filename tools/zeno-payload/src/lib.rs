@@ -10,7 +10,9 @@
 use std::ffi::c_void;
 use std::fs;
 
-type Handle = *mut c_void;
+mod luau;
+
+pub(crate) type Handle = *mut c_void;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -32,11 +34,11 @@ extern "system" {
     ) -> usize;
 }
 
-fn wide(text: &str) -> Vec<u16> {
+pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn module_base(name: &str) -> u64 {
+pub(crate) fn module_base(name: &str) -> u64 {
     unsafe { GetModuleHandleW(wide(name).as_ptr()) as u64 }
 }
 
@@ -46,7 +48,7 @@ fn module_path(module: u64) -> String {
     String::from_utf16_lossy(&buffer[..len as usize])
 }
 
-fn read(handle: Handle, address: u64, len: usize) -> Option<Vec<u8>> {
+pub(crate) fn read(handle: Handle, address: u64, len: usize) -> Option<Vec<u8>> {
     let mut buffer = vec![0u8; len];
     let mut got = 0usize;
     let ok = unsafe {
@@ -64,7 +66,7 @@ fn read(handle: Handle, address: u64, len: usize) -> Option<Vec<u8>> {
     Some(buffer)
 }
 
-fn read_u64(handle: Handle, address: u64) -> Option<u64> {
+pub(crate) fn read_u64(handle: Handle, address: u64) -> Option<u64> {
     if address < 0x10000 {
         return None;
     }
@@ -165,7 +167,7 @@ fn children(handle: Handle, instance: u64, offsets: &[(String, u64)], limit: usi
     out
 }
 
-fn config_dir() -> std::path::PathBuf {
+pub(crate) fn config_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("ZENO_CONFIG").unwrap_or_else(|_| {
         "C:\\Users\\ezan\\AppData\\Local\\Temp\\opencode\\zeno-payload".to_string()
     }))
@@ -958,7 +960,12 @@ fn worker() {
     let handle = unsafe { GetCurrentProcess() };
     let exe = module_base("RobloxPlayerBeta.exe");
 
-    let report = if config_dir().join("discover").is_file() {
+    let report = if config_dir().join("luau.txt").is_file() {
+        mark("luau");
+        let mut text = luau::run();
+        text.push_str(&format!("pid {}\n", unsafe { GetCurrentProcessId() }));
+        text
+    } else if config_dir().join("discover").is_file() {
         mark("discover");
         let mut text = format!("pid {}\nclient base 0x{exe:X}\n", unsafe {
             GetCurrentProcessId()
@@ -983,9 +990,26 @@ pub extern "system" fn DummyHookProc(code: i32, w: usize, l: isize) -> isize {
     0
 }
 
-/// Direct entry for manual mapping: no CRT startup, just the probe.
+/// Import-free probe used to test whether code can run from an image section
+/// the loader does not know about. Must not call anything: the mapped view has
+/// no resolved imports, so any call would fault on a zero IAT slot.
 #[no_mangle]
-pub extern "system" fn zeno_run(_: *mut c_void) -> u32 {
+pub extern "system" fn zeno_ping() -> u32 {
+    0x5EED_0001
+}
+
+/// Direct entry for manual mapping: no CRT startup, just the probe.
+///
+/// The injector's stub calls this as `(image_base, mode)` following the Win64
+/// ABI, so `mode` lands in `rdx`. Mode 7 returns without touching anything at
+/// all, which answers "does the client survive a hijacked call?" without
+/// `worker()` being in the picture.
+#[no_mangle]
+pub extern "system" fn zeno_run(_base: *mut c_void, mode: *mut c_void) -> u32 {
+    if mode as u64 == 7 {
+        return 7;
+    }
+    luau::breadcrumb("entered zeno_run");
     worker();
     1
 }
@@ -994,10 +1018,11 @@ pub extern "system" fn zeno_run(_: *mut c_void) -> u32 {
 pub extern "system" fn DllMain(_module: Handle, reason: u32, _reserved: *mut c_void) -> i32 {
     const DLL_PROCESS_ATTACH: u32 = 1;
     if reason == DLL_PROCESS_ATTACH {
-        // Manual mapping never gives us a loader thread, and remote thread
-        // creation is refused outright, so the work has to happen right here
-        // on whichever thread called the entry point.
-        worker();
+        // Keep this to a single breadcrumb. LoadLibraryW is holding the loader
+        // lock while we are inside DllMain, so anything heavy here stalls the
+        // whole process. The real work happens when the injector calls
+        // `zeno_run` directly once the module is loaded.
+        luau::breadcrumb("dllmain attach");
     }
     1
 }
