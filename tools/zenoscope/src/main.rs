@@ -41,6 +41,7 @@ struct Args {
     watch: Option<u64>,
     base: Option<PathBuf>,
     chain: Option<PathBuf>,
+    follow: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
         watch: None,
         base: None,
         chain: None,
+        follow: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -104,6 +106,9 @@ fn parse_args() -> Result<Args, String> {
             "--chain" => {
                 args.chain = Some(PathBuf::from(argv.next().ok_or("--chain needs a pack")?));
             }
+            "--follow" => {
+                args.follow = true;
+            }
             "--inspect" => {
                 let value = argv.next().ok_or("--inspect needs a page count")?;
                 args.inspect = Some(
@@ -125,7 +130,8 @@ fn parse_args() -> Result<Args, String> {
                 println!("zenoscope --force-dump      run a copy stub inside the client so its own");
                 println!("                            handler decrypts .text; visible to the anti-tamper");
                 println!("zenoscope --watch <secs>    sample .text and keep every decrypted page");
-                println!("           [--base <image>] [--out <path>]");
+                println!("           [--base <image>] [--out <path>] [--follow]");
+                println!("           --follow re-attaches when the client restarts");
                 println!("zenoscope --chain <hpp>     walk VisualEngine -> FakeDataModel -> DataModel");
                 println!("                            through the live client and print names");
                 std::process::exit(0);
@@ -630,6 +636,7 @@ fn run_watch(args: &Args, seconds: u64) -> Result<(), String> {
         seconds,
         args.out.clone(),
         args.rebuild,
+        args.follow,
     )?;
 
     println!();

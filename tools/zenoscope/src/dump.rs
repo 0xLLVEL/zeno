@@ -756,6 +756,7 @@ pub fn watch(
     seconds: u64,
     out: Option<PathBuf>,
     rebuild: bool,
+    follow: bool,
 ) -> Result<WatchReport, String> {
     match enable_debug_privilege() {
         Ok(true) => {}
@@ -763,6 +764,10 @@ pub fn watch(
             return Err("SeDebugPrivilege was not granted — run from an elevated shell".into())
         }
         Err(because) => return Err(format!("privilege: {because}")),
+    }
+
+    if follow {
+        return harvest(pid, module, base_image, seconds, out, rebuild);
     }
 
     let pid = match pid {
@@ -782,6 +787,359 @@ pub fn watch(
     let result = watch_with(handle, pid, module, base_image, seconds, out, rebuild);
     unsafe { CloseHandle(handle) };
     result
+}
+
+struct Target {
+    handle: Handle,
+    pid: u32,
+    base: u64,
+    path: String,
+}
+
+/// First live client that has `module` loaded. With `follow`, a dead `--pid`
+/// hint falls back to whatever the newest matching process is, which is what
+/// happens when the client restarts on a game switch.
+fn attach_target(hint: Option<u32>, module: &str, follow: bool) -> Result<Option<Target>, String> {
+    let candidates: Vec<Option<u32>> = match (follow, hint) {
+        (true, Some(h)) => vec![Some(h), None],
+        (true, None) | (false, None) => vec![None],
+        (false, Some(h)) => vec![Some(h)],
+    };
+
+    for candidate in candidates {
+        let pid = match candidate {
+            Some(pid) => pid,
+            None => match live::find_pid(crate::CLIENT_EXE) {
+                Some(pid) => pid,
+                None => continue,
+            },
+        };
+        if live::module_info(pid, module).is_none() {
+            continue;
+        }
+
+        let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "OpenProcess({pid}) with PROCESS_ALL_ACCESS failed ({}); elevation is required",
+                unsafe { GetLastError() }
+            ));
+        }
+
+        let Some((base, _size, path)) = live::module_info(pid, module) else {
+            unsafe { CloseHandle(handle) };
+            continue;
+        };
+
+        return Ok(Some(Target {
+            handle,
+            pid,
+            base,
+            path,
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Pages already harvested show up as bytes that differ from the on-disk
+/// ciphertext. Seeding the bitmap from that difference keeps a resumed pass
+/// from re-reading them and makes the coverage count the merged total.
+fn seed_captured(
+    image: &[u8],
+    disk: &[u8],
+    section: &Section,
+    raw: u64,
+    pages: usize,
+) -> Vec<bool> {
+    let mut captured = vec![false; pages];
+    if disk.len() != image.len() {
+        return captured;
+    }
+    for index in 0..pages as u64 {
+        let offset = index * 0x1000;
+        if offset >= raw {
+            break;
+        }
+        let start = section.raw_pointer as usize + offset as usize;
+        let end = (start + (raw - offset).min(0x1000) as usize).min(image.len());
+        if start >= end {
+            continue;
+        }
+        captured[index as usize] = image[start..end] != disk[start..end];
+    }
+    captured
+}
+
+/// Sample one pass over `.text` and copy every page the client has decrypted.
+/// Returns `(newly captured, readable this pass)`.
+fn scan_once(
+    handle: Handle,
+    base: u64,
+    section: &Section,
+    raw: u64,
+    image: &mut [u8],
+    captured: &mut [bool],
+) -> (u64, u64) {
+    let mut new_pages = 0u64;
+    let mut readable_total = 0u64;
+
+    for index in 0..captured.len() as u64 {
+        if captured[index as usize] {
+            continue;
+        }
+        let offset = index * 0x1000;
+        if offset >= raw {
+            break;
+        }
+        let address = base + section.virtual_address as u64 + offset;
+        let Some((protect, state)) = protection(handle, address) else {
+            continue;
+        };
+        if state != 0x1000 {
+            continue;
+        }
+        let access = protect & 0xFF;
+        if !matches!(access, 0x02 | 0x04 | 0x20 | 0x40 | 0x80) {
+            continue;
+        }
+        readable_total += 1;
+
+        let len = (raw - offset).min(0x1000);
+        let Ok(bytes) = read_page(handle, address, len as usize) else {
+            continue;
+        };
+
+        let file_offset = section.raw_pointer as u64 + offset;
+        let end = file_offset + len;
+        if end <= image.len() as u64 {
+            image[file_offset as usize..end as usize].copy_from_slice(&bytes[..len as usize]);
+            captured[index as usize] = true;
+            new_pages += 1;
+        }
+    }
+
+    (new_pages, readable_total)
+}
+
+/// Sampling that survives a client restart. The client spawns a fresh process
+/// on most game switches; pages already harvested stay in the in-memory image,
+/// so coverage is cumulative across every process the session touches.
+fn harvest(
+    pid_hint: Option<u32>,
+    module: &str,
+    base_image: Option<PathBuf>,
+    seconds: u64,
+    out: Option<PathBuf>,
+    rebuild: bool,
+) -> Result<WatchReport, String> {
+    let started = std::time::Instant::now();
+    let mut target: Option<Target> = None;
+    let mut notes: Vec<String> = Vec::new();
+    let mut pids: Vec<u32> = Vec::new();
+
+    let mut image: Option<Vec<u8>> = None;
+    let mut section: Option<Section> = None;
+    let mut captured: Vec<bool> = Vec::new();
+    let mut raw = 0u64;
+    let mut base = 0u64;
+    let mut module_path = String::new();
+    let mut source = PathBuf::new();
+    let mut out_path: Option<PathBuf> = None;
+    let mut before: Vec<usize> = Vec::new();
+    let mut new_pages = 0u64;
+    let mut readable_total = 0u64;
+    let mut last_report = 0u64;
+    let mut last_checkpoint = 0u64;
+
+    loop {
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= seconds {
+            break;
+        }
+
+        let alive = target
+            .as_ref()
+            .map(|t| live::module_info(t.pid, module).is_some())
+            .unwrap_or(false);
+
+        if !alive {
+            if let Some(dead) = target.take() {
+                unsafe { CloseHandle(dead.handle) };
+                notes.push(format!("pid {} exited at {}s", dead.pid, elapsed));
+                println!("  detach       pid {} at {}s", dead.pid, elapsed);
+            }
+
+            match attach_target(pid_hint, module, true)? {
+                Some(next) => {
+                    println!("  attach       pid {}  base 0x{:X}", next.pid, next.base);
+
+                    if image.is_none() {
+                        let src = Path::new(&next.path).to_path_buf();
+                        source = src.clone();
+                        let origin = base_image.clone().unwrap_or_else(|| src.clone());
+                        let bytes = std::fs::read(&origin)
+                            .map_err(|e| format!("cannot read {}: {e}", origin.display()))?;
+                        let parsed = PeImage::parse(bytes.clone())?;
+                        before = counts(&parsed);
+                        let text = parsed
+                            .sections
+                            .iter()
+                            .find(|s| s.name == ".text")
+                            .cloned()
+                            .ok_or("no .text section in this image")?;
+                        raw = text.raw_size as u64;
+                        let pages = text.span().div_ceil(0x1000) as usize;
+                        let disk = std::fs::read(&next.path)
+                            .map_err(|e| format!("cannot read {}: {e}", next.path))?;
+                        captured = seed_captured(&bytes, &disk, &text, raw, pages);
+                        let resumed = captured.iter().filter(|c| **c).count() as u64;
+                        if resumed > 0 {
+                            notes.push(format!("resumed with {resumed} pages already harvested"));
+                            println!(
+                                "  resume       {} pages already in the base image",
+                                crate::thousands(resumed)
+                            );
+                        }
+                        module_path = next.path.clone();
+                        out_path = Some(out.clone().unwrap_or_else(|| {
+                            let mut path = src.clone();
+                            let name = path
+                                .file_stem()
+                                .map(|n| format!("{}.watched.exe", n.to_string_lossy()))
+                                .unwrap_or_else(|| "watched.exe".into());
+                            path.set_file_name(name);
+                            path
+                        }));
+                        section = Some(text);
+                        image = Some(bytes);
+                        if origin != source {
+                            notes.push(format!("started from {}", origin.display()));
+                        }
+                    } else if next.path != module_path {
+                        unsafe { CloseHandle(next.handle) };
+                        return Err(format!(
+                            "client switched to a different build ({}); refusing to merge two layouts",
+                            next.path
+                        ));
+                    }
+
+                    base = next.base;
+                    pids.push(next.pid);
+                    target = Some(next);
+                }
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+
+        if let (Some(t), Some(sec), Some(img)) = (&target, &section, image.as_mut()) {
+            base = t.base;
+            let (new, _readable) = scan_once(t.handle, base, sec, raw, img, &mut captured);
+            new_pages += new;
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= last_report + 5 {
+            last_report = elapsed;
+            let pid = target.as_ref().map(|t| t.pid).unwrap_or(0);
+            println!(
+                "  {:>4}s  pid {:>6}  {} / {} pages captured",
+                elapsed,
+                pid,
+                crate::thousands(captured.iter().filter(|c| **c).count() as u64),
+                crate::thousands(captured.len() as u64)
+            );
+        }
+
+        if elapsed >= last_checkpoint + 60 {
+            last_checkpoint = elapsed;
+            if let (Some(path), Some(img)) = (&out_path, image.as_ref()) {
+                if std::fs::write(path, img).is_ok() {
+                    println!(
+                        "  checkpoint   {} pages -> {}",
+                        crate::thousands(captured.iter().filter(|c| **c).count() as u64),
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    let Some(image) = image else {
+        return Err(format!("{module} was never attached for pid {pid_hint:?}"));
+    };
+    let Some(output) = out_path else {
+        return Err("harvest finished without an output path".into());
+    };
+
+    std::fs::write(&output, &image)
+        .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+
+    let after = counts(&PeImage::parse(image.clone())?);
+
+    let mut rebuilt_path = None;
+    if rebuild {
+        match &target {
+            Some(t) => {
+                let parsed = PeImage::parse(image.clone())?;
+                let mut blocks = Vec::with_capacity(parsed.sections.len());
+                for sec in &parsed.sections {
+                    let mut block = seed_block(&image, sec);
+                    if sec.name != ".text" {
+                        fill_block(t.handle, t.base, sec, &mut block);
+                    }
+                    blocks.push(block);
+                }
+                let rebuilt = rebuild_image(&image, &parsed.sections, &blocks)?;
+                let mut path = output.clone();
+                path.set_file_name(format!(
+                    "{}.rebuilt.exe",
+                    path.file_stem().map(|n| n.to_string_lossy()).unwrap_or_default()
+                ));
+                std::fs::write(&path, &rebuilt)
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                rebuilt_path = Some(path);
+            }
+            None => notes.push("rebuild skipped: the client is no longer running".into()),
+        }
+    }
+
+    if pids.len() > 1 {
+        let listed: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+        notes.push(format!("merged {} processes: {}", pids.len(), listed.join(", ")));
+    }
+
+    let pid = target.as_ref().map(|t| t.pid).unwrap_or(*pids.last().unwrap_or(&0));
+    let module_path = if module_path.is_empty() {
+        source.display().to_string()
+    } else {
+        module_path
+    };
+
+    if let Some(t) = target.take() {
+        unsafe { CloseHandle(t.handle) };
+    }
+
+    Ok(WatchReport {
+        pid,
+        base,
+        module_path,
+        pages_total: captured.len() as u64,
+        pages_readable: captured.iter().filter(|c| **c).count() as u64,
+        new_pages,
+        seconds,
+        prologues_before: before,
+        prologues_after: after,
+        output_bytes: std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0),
+        output,
+        rebuilt: rebuilt_path,
+        notes,
+    })
 }
 
 fn watch_with(
@@ -814,49 +1172,16 @@ fn watch_with(
     let span = section.span() as u64;
     let raw = section.raw_size as u64;
     let pages = span.div_ceil(0x1000);
-    let mut captured = vec![false; pages as usize];
-    let mut readable_total = 0u64;
+    let disk = std::fs::read(&module_path).unwrap_or_default();
+    let mut captured = seed_captured(&image, &disk, &section, raw, pages as usize);
     let mut new_pages = 0u64;
 
     let started = std::time::Instant::now();
     let mut last_report = 0u64;
 
     loop {
-        for index in 0..pages {
-            if captured[index as usize] {
-                continue;
-            }
-            let offset = index * 0x1000;
-            if offset >= raw {
-                break;
-            }
-            let address = base + section.virtual_address as u64 + offset;
-            let Some((protect, state)) = protection(handle, address) else {
-                continue;
-            };
-            if state != 0x1000 {
-                continue;
-            }
-            let access = protect & 0xFF;
-            let readable = matches!(access, 0x02 | 0x04 | 0x20 | 0x40 | 0x80);
-            if !readable {
-                continue;
-            }
-            readable_total += 1;
-
-            let len = (raw - offset).min(0x1000);
-            let Ok(bytes) = read_page(handle, address, len as usize) else {
-                continue;
-            };
-
-            let file_offset = section.raw_pointer as u64 + offset;
-            let end = file_offset + len;
-            if end <= image.len() as u64 {
-                image[file_offset as usize..end as usize].copy_from_slice(&bytes[..len as usize]);
-                captured[index as usize] = true;
-                new_pages += 1;
-            }
-        }
+        let (new, _readable) = scan_once(handle, base, &section, raw, &mut image, &mut captured);
+        new_pages += new;
 
         let elapsed = started.elapsed().as_secs();
         if elapsed >= seconds {
@@ -920,7 +1245,7 @@ fn watch_with(
         base,
         module_path,
         pages_total: pages,
-        pages_readable: readable_total,
+        pages_readable: captured.iter().filter(|c| **c).count() as u64,
         new_pages,
         seconds,
         prologues_before: before,
