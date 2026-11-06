@@ -27,7 +27,7 @@ jobs:
           key: luau-0.653-${{ runner.os }}
 
       - name: configure
-        run: cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
       - name: build
         run: cmake --build zeno-core/build --config Release --parallel
