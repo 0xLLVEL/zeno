@@ -63,7 +63,7 @@ if (-not $SkipPayload) {
     }
 
     Invoke-Native "cmake configure" {
-        cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        cmake -S zeno-core -B zeno-core/build -A x64 -DCMAKE_BUILD_TYPE=Release
     }
     Invoke-Native "cmake build" {
         cmake --build zeno-core/build --config Release --parallel

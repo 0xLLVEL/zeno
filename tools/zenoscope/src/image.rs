@@ -77,11 +77,28 @@ pub trait Image {
             .unwrap_or(false)
     }
 
+    fn read_u32(&self, rva: u32) -> Option<u32> {
+        let b = self.read_rva(rva, 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     fn read_u64(&self, rva: u32) -> Option<u64> {
         let b = self.read_rva(rva, 8)?;
         Some(u64::from_le_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
+    }
+
+    fn read_cstr(&self, rva: u32, max: usize) -> Option<String> {
+        let mut out = Vec::new();
+        for i in 0..max {
+            let b = self.read_rva(rva.wrapping_add(i as u32), 1)?[0];
+            if b == 0 {
+                break;
+            }
+            out.push(b);
+        }
+        Some(String::from_utf8_lossy(&out).into_owned())
     }
 
     fn code_bytes(&self) -> usize {

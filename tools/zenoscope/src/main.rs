@@ -6,6 +6,7 @@
 //!     client — its `.text` is encrypted on disk)
 //!   * the file on disk (fallback, and how the tool is exercised in tests)
 
+mod hpp;
 mod image;
 mod live;
 mod scan;
@@ -34,6 +35,7 @@ struct Args {
     exe: Option<PathBuf>,
     pid: Option<u32>,
     probe: Option<u32>,
+    verify: Option<PathBuf>,
     module: Option<String>,
     json: Option<PathBuf>,
 }
@@ -43,6 +45,7 @@ fn parse_args() -> Result<Args, String> {
         exe: None,
         pid: None,
         probe: None,
+        verify: None,
         module: None,
         json: None,
     };
@@ -70,9 +73,13 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| format!("--probe expects a number, got {value}"))?,
                 );
             }
+            "--verify" => {
+                args.verify = Some(PathBuf::from(argv.next().ok_or("--verify needs a path")?));
+            }
             "-h" | "--help" => {
                 println!("zenoscope [--pid <n> | --exe <path>] [--module <name>] [--json <out>]");
-                println!("zenoscope --probe <pid>   report which access masks the target grants");
+                println!("zenoscope --probe <pid>     report which access masks the target grants");
+                println!("zenoscope --verify <hpp>    check an offsets pack against this client");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),

@@ -21,6 +21,7 @@ else()
     GIT_REPOSITORY https://github.com/luau-lang/luau.git
     GIT_TAG        0.653
     GIT_SHALLOW    TRUE
+    PATCH_COMMAND  ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_luau_policy.cmake"
   )
   set(LUAU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LUAU_BUILD_CLI OFF CACHE BOOL "" FORCE)
