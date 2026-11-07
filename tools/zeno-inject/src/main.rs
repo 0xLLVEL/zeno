@@ -2310,6 +2310,117 @@ fn find_byte_map(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Finds live `lua_State` objects without needing an interpreter frame. The
+/// header tag byte is 0x0A at +1 in this build, and the stack window
+/// (stack <= base <= top <= stack_last) plus the `global` back-pointer at
+/// `global+0x78 == state` are strong enough that false hits are rare.
+fn find_states(pid: u32) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+
+    let mut address = 0x10000u64;
+    let mut info = [0u8; 48];
+    let mut scanned: u64 = 0;
+    let mut hits: Vec<u64> = Vec::new();
+    let chunk = 4u64 * 1024 * 1024;
+    let span = 0x100usize;
+
+    while address < 0x7FFF_FFFF_0000 && hits.len() < 16 {
+        let got = unsafe {
+            VirtualQueryEx(handle, address as *const c_void, info.as_mut_ptr() as *mut c_void, 48)
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+
+        let readable = state == 0x1000
+            && protect & 0x100 == 0
+            && matches!(protect & 0xFF, 0x02 | 0x04 | 0x06 | 0x08 | 0x20 | 0x40 | 0x80);
+        if readable && size <= 512 * 1024 * 1024 {
+            let mut cursor = 0u64;
+            let mut buffer = vec![0u8; chunk as usize + span];
+            while cursor < size {
+                let want = chunk.min(size - cursor);
+                let mut read = 0usize;
+                let ok = unsafe {
+                    ReadProcessMemory(
+                        handle,
+                        (base + cursor) as *const c_void,
+                        buffer.as_mut_ptr() as *mut c_void,
+                        want as usize,
+                        &mut read,
+                    )
+                };
+                if ok != 0 && read > span {
+                    let window = &buffer[..read];
+                    let mut i = 0usize;
+                    while i + span <= window.len() {
+                        if window[i + 1] != 0x0A {
+                            i += 8;
+                            continue;
+                        }
+                        let q = |off: usize| -> u64 {
+                            u64::from_le_bytes(window[i + off..i + off + 8].try_into().unwrap())
+                        };
+                        let global = q(0x50);
+                        let stack = q(0x48);
+                        let l_base = q(0x58);
+                        let top = q(0x60);
+                        let last = q(0x68);
+                        let end_ci = q(0x20);
+                        if stack > 0x10000
+                            && stack <= l_base
+                            && l_base <= top
+                            && top <= last
+                            && last - stack < 0x1000_0000
+                            && global > 0x10000
+                            && end_ci > 0x10000
+                        {
+                            let candidate = base + cursor + i as u64;
+                            let mainthread = read_u64(handle, global + G_U64_MAINTHREAD);
+                            if mainthread == candidate {
+                                println!(
+                                    "findstate   0x{candidate:X} global 0x{global:X} stack 0x{stack:X} top 0x{top:X} last 0x{last:X}"
+                                );
+                                hits.push(candidate);
+                            }
+                        }
+                        i += 8;
+                    }
+                    scanned += read as u64;
+                }
+                cursor += want;
+            }
+        }
+        address = base + size;
+        if address <= base {
+            break;
+        }
+    }
+
+    println!(
+        "findstate   scanned {:.1} MB in {pid}, {} state(s)",
+        scanned as f64 / 1_048_576.0,
+        hits.len()
+    );
+    for at in &hits {
+        let hdr = read_bytes(handle, *at, 0x80).unwrap_or_default();
+        let hex: Vec<String> = hdr.iter().map(|b| format!("{b:02X}")).collect();
+        println!("findstate   0x{at:X}: {}", hex.join(" "));
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 /// `EB FE` filler in the client's `.text`, used as a parking lot: a hijacked
 /// thread that returns here spins without touching its stack, so the original
 /// context can be put back at leisure.
@@ -3176,10 +3287,28 @@ fn remote_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, Strin
         }
 
         if armed {
+            let clean = failure.is_none();
             unsafe {
                 SuspendThread(thread);
-                SetThreadContext(thread, original.as_ptr() as *const c_void);
-                ResumeThread(thread);
+                if clean {
+                    SetThreadContext(thread, original.as_ptr() as *const c_void);
+                    ResumeThread(thread);
+                } else {
+                    // The thread is mid-call. Putting the pre-hijack context
+                    // back would resume it inside a half-built Lua frame, and
+                    // that is what actually corrupts the client. Park it on the
+                    // `EB FE` pad instead and leave it spinning there.
+                    let mut parked = vec![0u8; CONTEXT_SIZE];
+                    *(parked.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+                    if GetThreadContext(thread, parked.as_mut_ptr() as *mut c_void) != 0 {
+                        *(parked.as_mut_ptr().add(0xF8) as *mut u64) = park;
+                        SetThreadContext(thread, parked.as_ptr() as *const c_void);
+                    }
+                    ResumeThread(thread);
+                    println!(
+                        "run         thread {id} left parked, not restored: a mid-frame restore corrupts the client"
+                    );
+                }
             }
         } else {
             unsafe { ResumeThread(thread) };
@@ -3726,6 +3855,24 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
             // bytecode, and this chunk cannot throw.
             if !write_tvalue(handle, function_slot, value, LUA_TFUNCTION) {
                 return None;
+            }
+            // This client's VM has a native-code path: `luau_precall` tags the
+            // frame as native when `proto->exectarget != 0 && proto->execdata`
+            // and then dispatches through a JIT entry instead of the
+            // interpreter. Bytecode protos must leave both fields null. If the
+            // loader left anything behind them, the dispatch lands on a bad
+            // pointer and the CFG guard fires `int 0x29`. Force the interpreter.
+            let proto = read_u64(handle, value + 0x18);
+            if proto > 0x10000 {
+                let target = read_u64(handle, proto + 0x8);
+                let data = read_u64(handle, proto + 0x10);
+                if target != 0 || data != 0 {
+                    println!(
+                        "exec        clearing native entry proto 0x{proto:X} exectarget 0x{target:X} execdata 0x{data:X}"
+                    );
+                    let _ = write_u64_at(handle, proto + 0x8, 0);
+                    let _ = write_u64_at(handle, proto + 0x10, 0);
+                }
             }
             if !write_u64_at(handle, state + LUA_U64_TOP, function_slot + 16) {
                 return None;
@@ -4708,6 +4855,7 @@ fn main() -> Result<(), String> {
     let mut scan_state: Option<u64> = None;
     let mut classify_state: Option<(u64, u8, u8)> = None;
     let mut findmap = false;
+    let mut findstate = false;
     let mut opmap_probe: Option<Vec<u8>> = None;
     let mut carrier: Option<String> = None;
     let mut use_existing = false;
@@ -4905,6 +5053,7 @@ fn main() -> Result<(), String> {
                 );
             }
             "--findmap" => findmap = true,
+            "--findstate" => findstate = true,
             "--opmap" => {
                 let text = argv.next().ok_or("--opmap needs hex bytes")?;
                 let mut bytes = Vec::new();
@@ -5062,6 +5211,11 @@ fn main() -> Result<(), String> {
     if findmap {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return find_byte_map(target);
+    }
+
+    if findstate {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_states(target);
     }
 
     if let Some(bytes) = opmap_probe {
