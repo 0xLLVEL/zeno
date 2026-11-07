@@ -2489,6 +2489,104 @@ fn describe_state(handle: Handle, modules: &[Module], state: u64) {
     }
 }
 
+/// Walks the collector's all-object list. The offset of `allgc` inside
+/// `global_State` is not published, so it is discovered: every qword slot in
+/// the first page of the global is treated as a candidate head and the chain
+/// is followed for a few links, keeping only slots where every object header
+/// carries a plausible type byte. The longest surviving chain is the list.
+fn gc_walk(pid: u32, global: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let Some(page) = read_bytes(handle, global, 0x1000) else {
+        unsafe { CloseHandle(handle) };
+        return Err("cannot read global_State".into());
+    };
+    let qword = |bytes: &[u8], off: usize| {
+        u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+    };
+
+    let mut candidates: Vec<(usize, u64, u32)> = Vec::new();
+    for off in (0..0x1000usize).step_by(8) {
+        let head = qword(&page, off);
+        if head < 0x10000 {
+            continue;
+        }
+        let mut cursor = head;
+        let mut links = 0u32;
+        for _ in 0..6 {
+            let Some(header) = read_bytes(handle, cursor, 16) else { break };
+            let next = qword(&header, 8);
+            let tt = header[1];
+            if tt > 0x30 {
+                break;
+            }
+            links += 1;
+            if next < 0x10000 {
+                break;
+            }
+            cursor = next;
+        }
+        if links >= 4 {
+            candidates.push((off, head, links));
+        }
+    }
+    candidates.sort_by_key(|(_, _, links)| std::cmp::Reverse(*links));
+    println!("gcwalk      {} candidate list heads", candidates.len());
+    for (off, head, links) in candidates.iter().take(6) {
+        println!("gcwalk      global+{off:#05X} head 0x{head:X} chain {links}");
+    }
+    // The main thread is itself a collector object, so it is always a valid
+    // entry point into the all-object list.
+    let mainthread = qword(&page, 0x78);
+    let entry = match candidates.first().copied() {
+        Some((off, head, _)) => {
+            println!("gcwalk      using global+{off:#05X}");
+            head
+        }
+        None => {
+            println!("gcwalk      falling back to mainthread 0x{mainthread:X}");
+            mainthread
+        }
+    };
+    let off = 0usize;
+    let head = entry;
+
+    let mut counts = std::collections::BTreeMap::<u8, u32>::new();
+    let mut first = std::collections::BTreeMap::<u8, u64>::new();
+    let mut cursor = head;
+    let mut seen = 0u32;
+    while seen < 400_000 {
+        let Some(header) = read_bytes(handle, cursor, 16) else { break };
+        let next = qword(&header, 8);
+        let tt = header[1];
+        *counts.entry(tt).or_insert(0) += 1;
+        first.entry(tt).or_insert(cursor);
+        seen += 1;
+        if next < 0x10000 {
+            break;
+        }
+        cursor = next;
+    }
+    println!("gcwalk      global+{off:#05X} walked {seen} objects");
+    for (tt, count) in &counts {
+        println!("gcwalk      tt {tt:02X}: {count}");
+    }
+    for (tt, address) in &first {
+        println!("gcwalk      --- tt {tt:02X} first 0x{address:X}");
+        if let Some(bytes) = read_bytes(handle, *address, 0x100) {
+            for row in 0..16 {
+                let chunk = &bytes[row * 16..row * 16 + 16];
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+                println!("gcwalk      +{:03X}  {}", row * 16, hex.join(" "));
+            }
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 fn vm_info(pid: u32, state: u64) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
@@ -4324,6 +4422,7 @@ fn main() -> Result<(), String> {
     let mut sampler: Option<(u32, u32, u64)> = None;
     let mut dump: Option<(u32, u64, usize)> = None;
     let mut vminfo: Option<u64> = None;
+    let mut gcwalk: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
     let mut xthread: Option<(u64, [u64; 4], u64)> = None;
     let mut hijack_now_opts: Option<(u64, [u64; 4], u64)> = None;
@@ -4413,6 +4512,13 @@ fn main() -> Result<(), String> {
                     rva,
                     span,
                 ));
+            }
+            "--gcwalk" => {
+                let value = argv.next().ok_or("--gcwalk needs a global_State address")?;
+                gcwalk = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
             }
             "--vminfo" => {
                 let value = argv.next().ok_or("--vminfo needs a lua_State address")?;
@@ -4593,6 +4699,11 @@ fn main() -> Result<(), String> {
         }
         None => None,
     };
+
+    if let Some(global) = gcwalk {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return gc_walk(target, global);
+    }
 
     if let Some(state) = vminfo {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
