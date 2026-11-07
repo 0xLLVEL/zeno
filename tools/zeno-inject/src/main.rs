@@ -1742,6 +1742,37 @@ fn dump_memory(pid: u32, address: u64, length: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn raw_dump(pid: u32, address: u64, length: usize) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let mut offset = 0usize;
+    while offset < length {
+        let chunk = (length - offset).min(0x20);
+        let mut bytes = vec![0u8; chunk];
+        let mut got = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                handle,
+                (address + offset as u64) as *const c_void,
+                bytes.as_mut_ptr() as *mut c_void,
+                chunk,
+                &mut got,
+            )
+        };
+        if ok == 0 || got != chunk {
+            println!("bytes       0x{:X} unreadable", address + offset as u64);
+            break;
+        }
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        println!("bytes       +{:04X}  {}", offset, hex.join(" "));
+        offset += chunk;
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 fn dump_in(handle: Handle, address: u64, length: usize) {
     let mut offset = 0usize;
     while offset < length {
@@ -2494,6 +2525,249 @@ fn describe_state(handle: Handle, modules: &[Module], state: u64) {
 /// the first page of the global is treated as a candidate head and the chain
 /// is followed for a few links, keeping only slots where every object header
 /// carries a plausible type byte. The longest surviving chain is the list.
+fn report_closure(
+    handle: Handle,
+    modules: &[Module],
+    label: &str,
+    closure: u64,
+    dump_proto: bool,
+) -> bool {
+    if closure < 0x10000 {
+        return false;
+    }
+    let is_c = read_u8_at(handle, closure + 5).unwrap_or(0xff);
+    let stacksize = read_u8_at(handle, closure + 6).unwrap_or(0xff);
+    let preload = read_u8_at(handle, closure + 7).unwrap_or(0xff);
+    let env = read_u64(handle, closure + 0x10);
+    println!(
+        "lfind       {label} closure 0x{closure:X} isC {is_c} stacksize {stacksize} preload {preload} env {}",
+        module_hit(modules, env)
+    );
+    if is_c != 0 {
+        let f = read_u64(handle, closure + 0x28);
+        println!("lfind         c.f {}", module_hit(modules, f));
+        return false;
+    }
+    for off in [0x18u64, 0x20, 0x28, 0x30] {
+        let p = read_u64(handle, closure + off);
+        if p < 0x10000 {
+            continue;
+        }
+        let code = read_u64(handle, p + 0x68);
+        let sizecode = read_i32_at(handle, p + 0xa8).unwrap_or(-1);
+        let plausible = code > 0x10000 && (0..=100000).contains(&sizecode);
+        println!(
+            "lfind         +{off:02X} -> 0x{p:X} code 0x{code:X} sizecode {sizecode}{}",
+            if plausible { "  PROTO?" } else { "" }
+        );
+        if dump_proto && plausible {
+            if let Some(head) = read_bytes(handle, p, 0x20) {
+                let hex: Vec<String> = head.iter().map(|b| format!("{b:02X}")).collect();
+                println!("lfind         proto head {}", hex.join(" "));
+            }
+            for field in [
+                0x08u64, 0x10, 0x18, 0x20, 0x28, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78,
+                0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8, 0xd0, 0xd8,
+            ] {
+                let v = read_u64(handle, p + field);
+                let d = read_i32_at(handle, p + field).unwrap_or(0);
+                println!("lfind         proto+{field:02X} = 0x{v:X} (i32 {d}) {}", module_hit(modules, v));
+            }
+            if let Some(words) = read_bytes(handle, code, 0x60) {
+                let hex: Vec<String> = words.iter().map(|b| format!("{b:02X}")).collect();
+                println!("lfind         code[0..0x60] {}", hex.join(" "));
+            }
+        }
+    }
+    true
+}
+
+fn scan_live_states(pid: u32) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let Some(client) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(EXE)) else {
+        unsafe { CloseHandle(handle) };
+        return Err("client module not found".into());
+    };
+    let client_base = client.base;
+    let client_end = client.base + client.size;
+
+    let ids = threads_of(pid);
+    let mut threads: Vec<(u32, Handle)> = Vec::new();
+    for id in ids {
+        let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+        if !thread.is_null() {
+            threads.push((id, thread));
+        }
+    }
+    println!("findl       {} threads held open", threads.len());
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut rounds = 0u64;
+    while std::time::Instant::now() < deadline {
+        rounds += 1;
+        for (id, thread) in &threads {
+            unsafe { SuspendThread(*thread) };
+            let mut context = vec![0u8; CONTEXT_SIZE];
+            unsafe {
+                *(context.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL;
+            }
+            let ok = unsafe { GetThreadContext(*thread, context.as_mut_ptr() as *mut c_void) } != 0;
+            let mut regs = [0u64; 15];
+            if ok {
+                let slots = [
+                    0x78usize, 0x80, 0x88, 0x90, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8,
+                    0xE0, 0xE8, 0xF0,
+                ];
+                for (index, slot) in slots.iter().enumerate() {
+                    regs[index] = unsafe { *(context.as_ptr().add(*slot) as *const u64) };
+                }
+            }
+            let rip = unsafe { *(context.as_ptr().add(0xF8) as *const u64) };
+            unsafe { ResumeThread(*thread) };
+            if !ok {
+                continue;
+            }
+            for value in regs {
+                if value < 0x10000 || value % 8 != 0 || !seen.insert(value) {
+                    continue;
+                }
+                if read_u8_at(handle, value + LUA_U8_TT) != Some(LUA_TTHREAD) {
+                    continue;
+                }
+                let global = read_u64(handle, value + LUA_U64_GLOBAL);
+                let stack = read_u64(handle, value + LUA_U64_STACK);
+                let top = read_u64(handle, value + LUA_U64_TOP);
+                let ci = read_u64(handle, value + LUA_U64_CI);
+                let base_ci = read_u64(handle, value + LUA_U64_BASE_CI);
+                let end_ci = read_u64(handle, value + LUA_U64_END_CI);
+                let size_ci = read_i32_at(handle, value + LUA_I32_SIZE_CI).unwrap_or(-1);
+                if global < 0x10000 || stack < 0x10000 || top <= stack || ci < base_ci {
+                    continue;
+                }
+                if end_ci <= base_ci || ci >= end_ci {
+                    continue;
+                }
+                if !(1..=64).contains(&size_ci) {
+                    continue;
+                }
+                if end_ci - base_ci > 64 * CALLINFO_STRIDE {
+                    continue;
+                }
+                let frames = (ci - base_ci) / CALLINFO_STRIDE;
+                println!(
+                    "findl       thread {id} rip {} state 0x{value:X} global 0x{global:X} frames {frames}",
+                    module_hit(&modules, rip)
+                );
+                if frames > 0 {
+                    let mut frame = ci;
+                    let mut found = false;
+                    for depth in 0..8u64 {
+                        if frame < base_ci {
+                            break;
+                        }
+                        let func = read_u64(handle, frame + CI_U64_FUNC);
+                        let fvalue = read_u64(handle, func);
+                        let ftag = read_i32_at(handle, func + TVAL_I32_TT).unwrap_or(-1);
+                        println!(
+                            "findl         frame[{depth}] ci 0x{frame:X} func 0x{func:X} tag {ftag} value 0x{fvalue:X}"
+                        );
+                        if ftag == LUA_TFUNCTION {
+                            if report_closure(handle, &modules, &format!("frame[{depth}]"), fvalue, true) {
+                                found = true;
+                            }
+                        }
+                        if frame == base_ci {
+                            break;
+                        }
+                        frame -= CALLINFO_STRIDE;
+                    }
+                    if found {
+                        println!("findl       hit after {rounds} rounds");
+                        unsafe { CloseHandle(handle) };
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    println!("findl       no live frame found in {rounds} rounds");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+fn find_lclosure(pid: u32, state: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let stack = read_u64(handle, state + LUA_U64_STACK);
+    let top = read_u64(handle, state + LUA_U64_TOP);
+    let base_ci = read_u64(handle, state + LUA_U64_BASE_CI);
+    let ci = read_u64(handle, state + LUA_U64_CI);
+    println!(
+        "lfind       state 0x{state:X} stack 0x{stack:X} top 0x{top:X} depth {}",
+        top.wrapping_sub(stack) / 16
+    );
+    println!("lfind       base_ci 0x{base_ci:X} ci 0x{ci:X}");
+
+    let mut frame = ci;
+    let mut seen = 0;
+    while frame >= base_ci && frame > 0x10000 && seen < 32 {
+        let func = read_u64(handle, frame + CI_U64_FUNC);
+        let value = read_u64(handle, func);
+        let tt = read_i32_at(handle, func + TVAL_I32_TT).unwrap_or(-1);
+        if tt == LUA_TFUNCTION {
+            report_closure(handle, &modules, &format!("frame[{seen}]"), value, true);
+        } else {
+            println!("lfind       frame[{seen}] ci 0x{frame:X} func 0x{func:X} tt {tt} value 0x{value:X}");
+        }
+        if frame == base_ci {
+            break;
+        }
+        frame = frame.wrapping_sub(CALLINFO_STRIDE);
+        seen += 1;
+    }
+
+    let span = top.wrapping_sub(stack);
+    let last = read_u64(handle, state + LUA_U64_STACK_LAST);
+    let scan_end = if last > top && last - stack <= 0x40000 {
+        last
+    } else {
+        stack + span
+    };
+    let span = scan_end.wrapping_sub(stack);
+    if stack > 0x10000 && span > 0 && span <= 0x40000 {
+        let Some(bytes) = read_bytes(handle, stack, span as usize) else {
+            unsafe { CloseHandle(handle) };
+            return Err("stack unreadable".into());
+        };
+        let mut hits = 0;
+        for (index, slot) in bytes.chunks_exact(16).enumerate() {
+            let tag = i32::from_le_bytes(slot[12..16].try_into().unwrap());
+            if tag != LUA_TFUNCTION {
+                continue;
+            }
+            let value = u64::from_le_bytes(slot[..8].try_into().unwrap());
+            if report_closure(handle, &modules, &format!("slot[{index}]"), value, false) {
+                hits += 1;
+            }
+            if hits >= 6 {
+                break;
+            }
+        }
+        println!("lfind       stack scan hits {hits}");
+    }
+
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 fn gc_walk(pid: u32, global: u64) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
@@ -4421,7 +4695,10 @@ fn main() -> Result<(), String> {
     let mut oracle_pid: Option<u32> = None;
     let mut sampler: Option<(u32, u32, u64)> = None;
     let mut dump: Option<(u32, u64, usize)> = None;
+    let mut raw_bytes: Option<(u64, usize)> = None;
     let mut vminfo: Option<u64> = None;
+    let mut lfind: Option<u64> = None;
+    let mut scan_live = false;
     let mut gcwalk: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
     let mut xthread: Option<(u64, [u64; 4], u64)> = None;
@@ -4496,6 +4773,17 @@ fn main() -> Result<(), String> {
                     length,
                 ));
             }
+            "--bytes" => {
+                let value = argv.next().ok_or("--bytes needs an address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let length = match argv.next() {
+                    Some(text) => usize::from_str_radix(text.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad length {text}"))?,
+                    None => 0x80,
+                };
+                raw_bytes = Some((address, length));
+            }
             "--sample" => {                let value = argv.next().ok_or("--sample needs an rva")?;
                 let rva = u32::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad rva {value}"))?;
@@ -4519,6 +4807,16 @@ fn main() -> Result<(), String> {
                     u64::from_str_radix(value.trim_start_matches("0x"), 16)
                         .map_err(|_| format!("bad address {value}"))?,
                 );
+            }
+            "--lfind" => {
+                let value = argv.next().ok_or("--lfind needs a lua_State address")?;
+                lfind = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--findl" => {
+                scan_live = true;
             }
             "--vminfo" => {
                 let value = argv.next().ok_or("--vminfo needs a lua_State address")?;
@@ -4705,6 +5003,16 @@ fn main() -> Result<(), String> {
         return gc_walk(target, global);
     }
 
+    if scan_live {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return scan_live_states(target);
+    }
+
+    if let Some(state) = lfind {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_lclosure(target, state);
+    }
+
     if let Some(state) = vminfo {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return vm_info(target, state);
@@ -4773,6 +5081,11 @@ fn main() -> Result<(), String> {
     if let Some((state, script)) = execute {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return lua_exec(target, state, &script, forced_thread);
+    }
+
+    if let Some((address, length)) = raw_bytes {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return raw_dump(target, address, length);
     }
 
     if let Some((target, address, length)) = dump {
