@@ -1,12 +1,18 @@
 """Compile a .lua file into a zeno-loadable blob.
 
 Pipeline:
-  1. luaucomp.exe compiles source -> canonical Luau bytecode (version 14,
-     typesversion 3). The compiler's opcode map MUST stay identity here: the
-     client's loader rewrites canonical -> dispatch bytes itself, so feeding it
-     pre-mapped bytecode double-maps every opcode and kills the VM.
+  1. luaucomp.exe compiles source -> bytecode (version 14, typesversion 3).
+     The compiler is driven with ZENO_OPMAP pointing at `opmap_client.bin`,
+     which maps each LOP number to the CLIENT's canonical opcode byte. That
+     byte is what the loader's own canonical->dispatch table (rva 0x735B280)
+     is indexed by. Emitting upstream LOP bytes instead makes the loader
+     rewrite every instruction to a byte the interpreter does not know, and
+     the dispatch guard fastfails with `int 0x29`.
   2. The 8-byte container magic is prepended, which is what LuaVMLoad strips
      before handing the payload to the protected parser.
+
+`opmap_client.bin` is rebuilt from `opmap_guess.json` by `build_opmap()`
+below, so it never goes stale relative to the measured map.
 
 Usage:
     python mkluau.py <in.lua> <out.bc>
@@ -20,14 +26,59 @@ import sys
 
 MAGIC = bytes([0x52, 0x7A, 0x10, 0x4A, 0x5B, 0x32, 0x09, 0xE0])
 COMPILER = r"C:\Users\ezan\AppData\Local\Temp\opencode\luau\luaucomp.exe"
+HERE = os.path.dirname(os.path.abspath(__file__))
+GUESS = os.path.join(HERE, "opmap_guess.json")
+OPMAP = os.path.join(HERE, "opmap_client.bin")
 
-# canonical opcode -> width in 32-bit words, for sanity checking a blob
-WIDTH = {}
+# LOP number -> name, in the compiler's own enum order.
+LOP_ORDER = [
+    "NOP", "BREAK", "LOADNIL", "LOADB", "LOADN", "LOADK", "MOVE", "GETGLOBAL",
+    "SETGLOBAL", "GETUPVAL", "SETUPVAL", "CLOSEUPVALS", "GETIMPORT", "GETTABLE",
+    "SETTABLE", "GETTABLEKS", "SETTABLEKS", "GETTABLEN", "SETTABLEN",
+    "NEWCLOSURE", "NAMECALL", "CALL", "RETURN", "JUMP", "JUMPBACK", "JUMPIF",
+    "JUMPIFNOT", "JUMPIFEQ", "JUMPIFLE", "JUMPIFLT", "JUMPIFNOTEQ",
+    "JUMPIFNOTLE", "JUMPIFNOTLT", "ADD", "SUB", "MUL", "DIV", "MOD", "POW",
+    "ADDK", "SUBK", "MULK", "DIVK", "MODK", "POWK", "AND", "OR", "ANDK", "ORK",
+    "CONCAT", "NOT", "MINUS", "LENGTH", "NEWTABLE", "DUPTABLE", "SETLIST",
+    "FORNPREP", "FORNLOOP", "FORGLOOP", "FORGPREP_INEXT", "FASTCALL3",
+    "FORGPREP_NEXT", "NATIVECALL", "GETVARARGS", "DUPCLOSURE", "PREPVARARGS",
+    "LOADKX", "JUMPX", "FASTCALL", "COVERAGE", "CAPTURE", "SUBRK", "DIVRK",
+    "FASTCALL1", "FASTCALL2", "FASTCALL2K", "FORGPREP", "JUMPXEQKNIL",
+    "JUMPXEQKB", "JUMPXEQKN", "JUMPXEQKS", "IDIV", "IDIVK", "GETUDATAKS",
+    "SETUDATAKS", "NAMECALLUDATA", "NEWCLASSMEMBER", "CALLFB", "CMPPROTO",
+    "FASTPCALL", "NEWCLASS", "CONSTRUCT", "FINCONSTRUCT", "GETPRIVATEFIELD",
+    "SETPRIVATEFIELD",
+]
+
+
+def build_opmap():
+    """Compose the client's canonical opcode table from the measured map.
+
+    `opmap_guess.json` is keyed by LOP name and holds the byte the client's
+    loader expects in the blob. The compiler reads a 256-byte table indexed by
+    LOP number, so reorder it here. NEWCLOSURE is derived by elimination: 94
+    dispatch bytes are valid and 93 names are measured, so the one unclaimed
+    dispatch byte (0xC7) belongs to the one unmeasured implemented opcode.
+    """
+    import json
+
+    measured = json.load(open(GUESS, "r", encoding="utf-8"))
+    table = bytearray(range(256))
+    for index, name in enumerate(LOP_ORDER):
+        entry = measured.get(name)
+        if entry is not None:
+            table[index] = entry["byte"]
+    if "NEWCLOSURE" not in measured:
+        table[LOP_ORDER.index("NEWCLOSURE")] = 0x73
+    with open(OPMAP, "wb") as f:
+        f.write(bytes(table))
+    return OPMAP
 
 
 def compile_source(src_path, out_path):
+    build_opmap()
     env = dict(os.environ)
-    env.pop("ZENO_OPMAP", None)  # identity: canonical bytecode out
+    env["ZENO_OPMAP"] = OPMAP
     raw = out_path + ".raw"
     proc = subprocess.run([COMPILER, src_path, raw], capture_output=True, text=True, env=env)
     sys.stderr.write(proc.stderr)
