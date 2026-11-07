@@ -84,17 +84,45 @@ def main(path):
             elif tag == 1:
                 consts.append(f"bool {bool(data[off])}")
                 off += 1
-            elif tag == 3:
+            elif tag == 2:
                 consts.append(f"num {struct.unpack_from('<d', data, off)[0]!r}")
                 off += 8
+            elif tag == 3:
+                idx, off = read_varint(data, off)
+                consts.append(f"str[{idx}] " + (repr(strings[idx]) if idx < len(strings) else "?"))
+            elif tag == 4:
+                import_id = struct.unpack_from("<i", data, off)[0]
+                off += 4
+                consts.append(f"import {import_id}")
+            elif tag in (5, 8):
+                length, off = read_varint(data, off)
+                keys = []
+                for _ in range(length):
+                    key, off = read_varint(data, off)
+                    if tag == 8:
+                        value = struct.unpack_from("<i", data, off)[0]
+                        off += 4
+                        keys.append(f"{key}:{value}")
+                    else:
+                        keys.append(str(key))
+                kind = "table-with-constants" if tag == 8 else "table"
+                consts.append(f"{kind} [{', '.join(keys)}]")
             elif tag == 6:
                 idx, off = read_varint(data, off)
-                consts.append(f"str {strings[idx]!r}")
-            elif tag == 12:
-                consts.append("vec " + data[off:off + 16].hex())
+                consts.append(f"closure proto {idx}")
+            elif tag == 7:
+                consts.append("vecf " + struct.unpack_from("<4f", data, off).__repr__())
                 off += 16
+            elif tag == 9:
+                sign = data[off]
+                magnitude, off = read_varint(data, off + 1)
+                consts.append(f"int {'-' if sign else ''}{magnitude}")
+            elif tag == 11:
+                consts.append("vecd " + struct.unpack_from("<4d", data, off).__repr__())
+                off += 32
             else:
                 consts.append(f"tag {tag}")
+                raise SystemExit(f"unknown constant tag {tag} at {off - 1}")
 
         print(f"\nproto {p}: stack {maxstack} params {nparams} nups {nups} "
               f"vararg {is_vararg} flags {flags:#x} code {sizecode} k {sizek}")

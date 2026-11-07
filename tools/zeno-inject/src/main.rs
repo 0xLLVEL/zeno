@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod map;
 
@@ -14,6 +14,12 @@ mod map;
 /// opcode then comes back as an error value instead of unwinding the hijacked
 /// thread into the client's own `errorJmp`.
 static PROTECT: AtomicBool = AtomicBool::new(false);
+
+/// When set, the freshly loaded chunk's environment pointer (closure+0x10) is
+/// repointed at this table before the call. A chunk compiled against the raw
+/// global table has no `game`, `workspace` or `Instance`; borrowing a live
+/// script closure's environment is how a chunk gets them.
+static ADOPT_ENV: AtomicU64 = AtomicU64::new(0);
 
 type Handle = *mut c_void;
 
@@ -2697,7 +2703,7 @@ fn report_closure(
     let preload = read_u8_at(handle, closure + 7).unwrap_or(0xff);
     let env = read_u64(handle, closure + 0x10);
     println!(
-        "lfind       {label} closure 0x{closure:X} isC {is_c} stacksize {stacksize} preload {preload} env {}",
+        "lfind       {label} closure 0x{closure:X} isC {is_c} stacksize {stacksize} preload {preload} env 0x{env:X} {}",
         module_hit(modules, env)
     );
     if is_c != 0 {
@@ -3956,6 +3962,23 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                     let top = read_u64(handle, state + LUA_U64_TOP);
                     let closure = read_u64(handle, top - 16);
                     println!("exec        closure 0x{closure:X}");
+                    let adopt = ADOPT_ENV.load(Ordering::Relaxed);
+                    if adopt != 0 {
+                        let mut written = 0usize;
+                        let ok = unsafe {
+                            WriteProcessMemory(
+                                handle,
+                                (closure + 0x10) as *mut c_void,
+                                &adopt as *const u64 as *const c_void,
+                                8,
+                                &mut written,
+                            )
+                        };
+                        println!(
+                            "exec        env adopted 0x{adopt:X} ({})",
+                            if ok != 0 { "written" } else { "FAILED" }
+                        );
+                    }
                     if let Some(head) = read_bytes(handle, closure, 0x80) {
                         for row in 0..8 {
                             let chunk = &head[row * 16..row * 16 + 16];
@@ -5154,6 +5177,12 @@ fn main() -> Result<(), String> {
             }
             "--protect" => {
                 PROTECT.store(true, Ordering::Relaxed);
+            }
+            "--env" => {
+                let value = argv.next().ok_or("--env needs a table address")?;
+                let table = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                ADOPT_ENV.store(table, Ordering::Relaxed);
             }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)

@@ -84,7 +84,14 @@ def compile_source(src_path, out_path):
     env = dict(os.environ)
     env["ZENO_OPMAP"] = OPMAP
     raw = out_path + ".raw"
-    proc = subprocess.run([COMPILER, src_path, raw], capture_output=True, text=True, env=env)
+    command = [COMPILER, src_path, raw]
+    if env.get("ZENO_O0"):
+        # -O0 keeps global reads as GETGLOBAL instead of GETIMPORT. An import
+        # constant has to resolve against the chunk's environment when it runs,
+        # and an unresolvable one raises; a GETGLOBAL on a missing key is just
+        # nil. Use it whenever the script probes a host's globals.
+        command.append("--O0")
+    proc = subprocess.run(command, capture_output=True, text=True, env=env)
     sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
         raise SystemExit(f"compile failed: {proc.returncode}")
