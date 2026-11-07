@@ -2554,6 +2554,31 @@ fn read_tstring(handle: Handle, string: u64) -> String {
     }
 }
 
+/// Renders one 16-byte TValue. The client tags strings with 6 in this build,
+/// not the 5 the upstream Luau header uses, so both are handled.
+fn describe_tvalue(handle: Handle, slot: u64) -> String {
+    let value = read_u64(handle, slot);
+    let tag = read_i32_at(handle, slot + TVAL_I32_TT).unwrap_or(-1);
+    match tag {
+        0 => "nil".to_string(),
+        1 => format!("boolean {}", value != 0),
+        3 => format!("number {}", f64::from_bits(value)),
+        4 => format!("vector 0x{value:X}"),
+        5 | 6 if value < 0x10000 => format!("string (null) tag {tag}"),
+        5 | 6 => {
+            let len = read_u32_at(handle, value + 0x14).unwrap_or(u32::MAX);
+            match read_bytes(handle, value + 0x18, (len as usize).min(64)) {
+                Some(bytes) => format!("string tag {tag} len {len} {:?}", String::from_utf8_lossy(&bytes)),
+                None => format!("string tag {tag} 0x{value:X} (unreadable)"),
+            }
+        }
+        8 => format!("function 0x{value:X}"),
+        9 => format!("userdata 0x{value:X}"),
+        10 => format!("thread 0x{value:X}"),
+        other => format!("tag {other} value 0x{value:X}"),
+    }
+}
+
 /// Walks a thread forward until it lands on the `EB FE` pad, leaving it
 /// suspended there so the next step can arm the same thread again.
 fn wait_for_park(
@@ -3364,6 +3389,15 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                             "exec        proto via +{off:02X} 0x{candidate:X} sizecode {sizecode} code 0x{code:X} [{}]",
                             hex.join(" ")
                         );
+                        let k = read_u64(handle, candidate + 0x60);
+                        if k >= 0x10000 {
+                            let mut line = String::new();
+                            for slot in 0..4u64 {
+                                let text = describe_tvalue(handle, k + slot * 16);
+                                line.push_str(&format!("k[{slot}]={text} "));
+                            }
+                            println!("exec        consts {line}");
+                        }
                         for field in [0x50u64, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80] {
                             let p = read_u64(handle, candidate + field);
                             if p < 0x10000 {
@@ -3403,29 +3437,12 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                     );
                     for back in 1..=8u64 {
                         let slot = top - 0x10 * back;
-                        let value = read_u64(handle, slot);
-                        let tag = read_i32_at(handle, slot + TVAL_I32_TT).unwrap_or(-1);
-                        let text = if tag == 5 { read_tstring(handle, value) } else { String::new() };
-                        println!("exec        top-{back} 0x{slot:X} tag {tag} value 0x{value:X} {text}");
+                        println!("exec        top-{back} 0x{slot:X} {}", describe_tvalue(handle, slot));
                     }
                     let mut cursor = base;
                     let mut index = 0;
                     while cursor + 16 <= top && index < 12 {
-                        let value = read_u64(handle, cursor);
-                        let tag = read_i32_at(handle, cursor + TVAL_I32_TT).unwrap_or(-1);
-                        let rendered = match tag {
-                            0 => "nil".to_string(),
-                            1 => format!("boolean {}", value != 0),
-                            3 => format!("number {}", f64::from_bits(value)),
-                            4 => format!("vector 0x{value:X}"),
-                            5 => format!("string {:?}", read_tstring(handle, value)),
-                            6 => format!("table 0x{value:X}"),
-                            8 => format!("function 0x{value:X}"),
-                            9 => format!("userdata 0x{value:X}"),
-                            10 => format!("thread 0x{value:X}"),
-                            other => format!("tag {other} value 0x{value:X}"),
-                        };
-                        println!("exec        out[{index}] {rendered}");
+                        println!("exec        out[{index}] {}", describe_tvalue(handle, cursor));
                         cursor += 16;
                         index += 1;
                     }
