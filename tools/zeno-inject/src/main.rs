@@ -313,8 +313,48 @@ fn hijack_rank(rip: u64, modules: &[Module]) -> u8 {
     1
 }
 
-fn threads_of(pid: u32) -> Vec<u32> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+/// Freezes the threads that are executing inside the client's Luau VM or
+/// loader. Roblox runs Luau on one dedicated thread; if that thread rehashes
+/// the global string table while our hijacked thread is inside `luau_load`,
+/// the bucket chain can be observed mid-splice and the hash walk spins
+/// forever. Suspending just those threads removes the race with almost no
+/// process-wide impact.
+fn freeze_lua_threads(handle: Handle, pid: u32, base: u64, keep: u32) -> Vec<Handle> {
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    let mut frozen = Vec::new();
+    for id in threads_of(pid) {
+        if id == keep {
+            continue;
+        }
+        let Some(rip) = thread_rip(handle, id) else {
+            continue;
+        };
+        let rva = rip.wrapping_sub(base);
+        let in_vm = (0x260_0000..0x270_0000).contains(&rva)
+            || (0x420_0000..0x440_0000).contains(&rva);
+        if !in_vm {
+            continue;
+        }
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, id) };
+        if thread.is_null() {
+            continue;
+        }
+        unsafe { SuspendThread(thread) };
+        frozen.push(thread);
+    }
+    frozen
+}
+
+fn thaw_threads(frozen: Vec<Handle>) {
+    for thread in frozen {
+        unsafe {
+            ResumeThread(thread);
+            CloseHandle(thread);
+        }
+    }
+}
+
+fn threads_of(pid: u32) -> Vec<u32> {    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot.is_null() || snapshot == -1isize as Handle {
         return Vec::new();
     }
@@ -3240,6 +3280,7 @@ fn remote_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, Strin
             };
             continue;
         }
+        let frozen = freeze_lua_threads(handle, pid, client_base, id);
         let mut context = original.clone();
         let mut armed = false;
         let mut failure: Option<String> = None;
@@ -3285,6 +3326,8 @@ fn remote_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, Strin
                 context = current;
             }
         }
+
+        thaw_threads(frozen);
 
         if armed {
             let clean = failure.is_none();
