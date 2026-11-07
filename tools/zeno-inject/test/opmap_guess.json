@@ -1,0 +1,467 @@
+{
+ "ADD": {
+  "byte": 67,
+  "score": 0.635,
+  "width": 1
+ },
+ "ADDK": {
+  "byte": 149,
+  "score": 0.903,
+  "width": 1
+ },
+ "AND": {
+  "byte": 202,
+  "score": 0.95,
+  "width": 1
+ },
+ "ANDK": {
+  "byte": 144,
+  "score": 0.95,
+  "width": 1
+ },
+ "BREAK": {
+  "byte": 227,
+  "score": 0.754,
+  "width": 0
+ },
+ "CALL": {
+  "byte": 159,
+  "score": 0.634,
+  "width": 1
+ },
+ "CALLFB": {
+  "byte": 37,
+  "score": 0.633,
+  "width": 2
+ },
+ "CAPTURE": {
+  "byte": 111,
+  "score": 0.65,
+  "width": 1
+ },
+ "CLOSEUPVALS": {
+  "byte": 120,
+  "score": 0.611,
+  "width": 1
+ },
+ "CMPPROTO": {
+  "byte": 8,
+  "score": 0.879,
+  "width": 2
+ },
+ "CONCAT": {
+  "byte": 211,
+  "score": 0.558,
+  "width": 1
+ },
+ "CONSTRUCT": {
+  "byte": 177,
+  "score": 0.922,
+  "width": 2
+ },
+ "COVERAGE": {
+  "byte": 47,
+  "score": 0.924,
+  "width": 1
+ },
+ "DIV": {
+  "byte": 236,
+  "score": 0.654,
+  "width": 1
+ },
+ "DIVK": {
+  "byte": 62,
+  "score": 0.322,
+  "width": 1
+ },
+ "DIVRK": {
+  "byte": 216,
+  "score": 0.902,
+  "width": 1
+ },
+ "DUPCLOSURE": {
+  "byte": 192,
+  "score": 0.649,
+  "width": 1
+ },
+ "DUPTABLE": {
+  "byte": 226,
+  "score": 0.863,
+  "width": 1
+ },
+ "FASTCALL": {
+  "byte": 76,
+  "score": 0.843,
+  "width": 1
+ },
+ "FASTCALL1": {
+  "byte": 187,
+  "score": 0.851,
+  "width": 1
+ },
+ "FASTCALL2": {
+  "byte": 129,
+  "score": 0.903,
+  "width": 2
+ },
+ "FASTCALL2K": {
+  "byte": 158,
+  "score": 0.903,
+  "width": 2
+ },
+ "FASTCALL3": {
+  "byte": 52,
+  "score": 0.897,
+  "width": 2
+ },
+ "FASTPCALL": {
+  "byte": 124,
+  "score": 0.458,
+  "width": 1
+ },
+ "FINCONSTRUCT": {
+  "byte": 148,
+  "score": 0.838,
+  "width": 1
+ },
+ "FORGLOOP": {
+  "byte": 110,
+  "score": 0.759,
+  "width": 1
+ },
+ "FORGPREP": {
+  "byte": 188,
+  "score": 0.386,
+  "width": 1
+ },
+ "FORGPREP_INEXT": {
+  "byte": 81,
+  "score": 0.597,
+  "width": 1
+ },
+ "FORGPREP_NEXT": {
+  "byte": 23,
+  "score": 0.549,
+  "width": 1
+ },
+ "FORNLOOP": {
+  "byte": 139,
+  "score": 0.805,
+  "width": 1
+ },
+ "FORNPREP": {
+  "byte": 168,
+  "score": 0.533,
+  "width": 1
+ },
+ "GETGLOBAL": {
+  "byte": 53,
+  "score": 0.636,
+  "width": 2
+ },
+ "GETIMPORT": {
+  "byte": 164,
+  "score": 0.855,
+  "width": 2
+ },
+ "GETPRIVATEFIELD": {
+  "byte": 119,
+  "score": 0.843,
+  "width": 2
+ },
+ "GETTABLE": {
+  "byte": 135,
+  "score": 0.768,
+  "width": 1
+ },
+ "GETTABLEKS": {
+  "byte": 77,
+  "score": 0.441,
+  "width": 2
+ },
+ "GETTABLEN": {
+  "byte": 19,
+  "score": 0.563,
+  "width": 1
+ },
+ "GETUDATAKS": {
+  "byte": 153,
+  "score": 0.682,
+  "width": 2
+ },
+ "GETUPVAL": {
+  "byte": 251,
+  "score": 0.95,
+  "width": 1
+ },
+ "GETVARARGS": {
+  "byte": 193,
+  "score": 0.552,
+  "width": 1
+ },
+ "IDIV": {
+  "byte": 182,
+  "score": 0.657,
+  "width": 1
+ },
+ "IDIVK": {
+  "byte": 217,
+  "score": 0.034,
+  "width": 1
+ },
+ "JUMP": {
+  "byte": 101,
+  "score": 0.85,
+  "width": 1
+ },
+ "JUMPBACK": {
+  "byte": 72,
+  "score": 0.782,
+  "width": 1
+ },
+ "JUMPIF": {
+  "byte": 43,
+  "score": 0.862,
+  "width": 1
+ },
+ "JUMPIFEQ": {
+  "byte": 241,
+  "score": 0.4,
+  "width": 1
+ },
+ "JUMPIFLE": {
+  "byte": 212,
+  "score": 0.436,
+  "width": 1
+ },
+ "JUMPIFLT": {
+  "byte": 183,
+  "score": 0.458,
+  "width": 1
+ },
+ "JUMPIFNOT": {
+  "byte": 14,
+  "score": 0.867,
+  "width": 1
+ },
+ "JUMPIFNOTEQ": {
+  "byte": 154,
+  "score": 0.405,
+  "width": 1
+ },
+ "JUMPIFNOTLE": {
+  "byte": 125,
+  "score": 0.435,
+  "width": 1
+ },
+ "JUMPIFNOTLT": {
+  "byte": 96,
+  "score": 0.459,
+  "width": 1
+ },
+ "JUMPX": {
+  "byte": 105,
+  "score": 0.774,
+  "width": 1
+ },
+ "JUMPXEQKB": {
+  "byte": 42,
+  "score": 0.94,
+  "width": 1
+ },
+ "JUMPXEQKN": {
+  "byte": 13,
+  "score": 0.81,
+  "width": 1
+ },
+ "JUMPXEQKNIL": {
+  "byte": 71,
+  "score": 0.898,
+  "width": 1
+ },
+ "JUMPXEQKS": {
+  "byte": 240,
+  "score": 0.908,
+  "width": 1
+ },
+ "LENGTH": {
+  "byte": 28,
+  "score": 0.353,
+  "width": 1
+ },
+ "LOADB": {
+  "byte": 169,
+  "score": 0.961,
+  "width": 1
+ },
+ "LOADK": {
+  "byte": 221,
+  "score": 0.564,
+  "width": 1
+ },
+ "LOADKX": {
+  "byte": 134,
+  "score": 0.982,
+  "width": 2
+ },
+ "LOADN": {
+  "byte": 140,
+  "score": 0.854,
+  "width": 1
+ },
+ "LOADNIL": {
+  "byte": 198,
+  "score": 0.973,
+  "width": 1
+ },
+ "MINUS": {
+  "byte": 57,
+  "score": 0.731,
+  "width": 1
+ },
+ "MOD": {
+  "byte": 207,
+  "score": 0.814,
+  "width": 1
+ },
+ "MODK": {
+  "byte": 33,
+  "score": 0.894,
+  "width": 1
+ },
+ "MOVE": {
+  "byte": 82,
+  "score": 0.985,
+  "width": 1
+ },
+ "MUL": {
+  "byte": 9,
+  "score": 0.624,
+  "width": 1
+ },
+ "MULK": {
+  "byte": 91,
+  "score": 0.643,
+  "width": 1
+ },
+ "NAMECALL": {
+  "byte": 197,
+  "score": 0.333,
+  "width": 2
+ },
+ "NATIVECALL": {
+  "byte": 235,
+  "score": 0.184,
+  "width": 1
+ },
+ "NEWCLASS": {
+  "byte": 206,
+  "score": 0.89,
+  "width": 2
+ },
+ "NEWCLASSMEMBER": {
+  "byte": 66,
+  "score": 0.893,
+  "width": 2
+ },
+ "NEWTABLE": {
+  "byte": 250,
+  "score": 0.55,
+  "width": 0
+ },
+ "NOP": {
+  "byte": 0,
+  "score": 0.883,
+  "width": 1
+ },
+ "NOT": {
+  "byte": 86,
+  "score": 0.933,
+  "width": 1
+ },
+ "OR": {
+  "byte": 231,
+  "score": 0.95,
+  "width": 1
+ },
+ "ORK": {
+  "byte": 173,
+  "score": 0.95,
+  "width": 1
+ },
+ "POW": {
+  "byte": 178,
+  "score": 0.803,
+  "width": 1
+ },
+ "POWK": {
+  "byte": 4,
+  "score": 0.747,
+  "width": 1
+ },
+ "PREPVARARGS": {
+  "byte": 163,
+  "score": 0.615,
+  "width": 1
+ },
+ "RETURN": {
+  "byte": 130,
+  "score": 0.774,
+  "width": 0
+ },
+ "SETGLOBAL": {
+  "byte": 24,
+  "score": 0.809,
+  "width": 2
+ },
+ "SETLIST": {
+  "byte": 95,
+  "score": 0.428,
+  "width": 2
+ },
+ "SETPRIVATEFIELD": {
+  "byte": 90,
+  "score": 0.635,
+  "width": 2
+ },
+ "SETTABLE": {
+  "byte": 106,
+  "score": 0.733,
+  "width": 1
+ },
+ "SETTABLEKS": {
+  "byte": 48,
+  "score": 0.706,
+  "width": 2
+ },
+ "SETTABLEN": {
+  "byte": 246,
+  "score": 0.532,
+  "width": 1
+ },
+ "SETUDATAKS": {
+  "byte": 255,
+  "score": 0.238,
+  "width": 2
+ },
+ "SETUPVAL": {
+  "byte": 222,
+  "score": 0.865,
+  "width": 1
+ },
+ "SUB": {
+  "byte": 38,
+  "score": 0.743,
+  "width": 1
+ },
+ "SUBK": {
+  "byte": 100,
+  "score": 0.005,
+  "width": 1
+ },
+ "SUBRK": {
+  "byte": 245,
+  "score": 0.875,
+  "width": 1
+ }
+}

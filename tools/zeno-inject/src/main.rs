@@ -3210,6 +3210,18 @@ fn remote_thread_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64
 
 const LUA_D_CALL_RVA: u64 = 0x26361C0;
 const LUA_LOAD_RVA: u64 = 0x426A570;
+/// `lua_pcall(lua_State*, int nargs, int nresults, int errfunc)`. Found by
+/// following `luaB_pcall` at `0x26993D0`, which tail-jumps here after loading
+/// `nresults = LUA_MULTRET`. It takes four plain arguments, so unlike
+/// `luaD_rawrunprotected` it needs no indirect call and stays inside the CFG.
+const LUA_PCALL_RVA: u64 = 0x2631F40;
+/// `luaD_rawrunprotected(lua_State*, Pfunc, void*)` — the primitive `lua_pcall`
+/// builds on. Its second argument is a function pointer, so it reaches its
+/// target through the guard dispatch, which only accepts real function entries.
+const LUA_RAWPROT_RVA: u64 = 0x26360B0;
+/// The `Pfunc` that `lua_pcall` hands to `luaD_rawrunprotected`: it reads a
+/// `CallS { StkId func; int nresults; }` and runs `luaD_call` on it.
+const LUA_F_CALL_RVA: u64 = 0x2632230;
 const LUA_COMPILE_RVA: u64 = 0x426A1F0;
 
 /// Loads a script with the client's own `luau_load` and runs it through the
@@ -3441,7 +3453,7 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                     }
                     let mut cursor = base;
                     let mut index = 0;
-                    while cursor + 16 <= top && index < 12 {
+                    while cursor + 16 <= top && index < 40 {
                         println!("exec        out[{index}] {}", describe_tvalue(handle, cursor));
                         cursor += 16;
                         index += 1;
@@ -3696,6 +3708,13 @@ fn lua_classify(
     let candidates: Vec<u8> = (from..=to).collect();
     let count = candidates.len();
 
+    // A direct `luaD_call` runs the chunk unprotected, so one raising opcode
+    // unwinds the hijacked thread and takes the client with it. `lua_pcall`
+    // wraps the same call in `luaD_rawrunprotected`, so a raise comes back as a
+    // status and an error value instead. That is the only way to sweep all 94
+    // opcodes without losing the client on the first one that errors.
+    let protected = std::env::var("ZENO_PCALL").is_ok();
+
     let blob_region = unsafe {
         VirtualAllocEx(
             handle,
@@ -3745,16 +3764,35 @@ fn lua_classify(
         return Err("name write failed".into());
     }
 
-    let global = read_u64(handle, state + LUA_U64_GLOBAL);
-    let pcall_value = read_u64(handle, global + G_U64_BUILTIN_PCALL);
-    if pcall_value < 0x10000 {
-        unsafe { CloseHandle(handle) };
-        return Err(format!("builtin pcall is not resolved (0x{pcall_value:X})"));
-    }
     println!("classify    {} candidates 0x{from:02X}..0x{to:02X}", count);
 
     let index = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let call_slot = std::rc::Rc::new(std::cell::Cell::new(0u64));
+
+    // `lua_pcall` is a wrapper, and that wrapper is what misbehaves here: it
+    // leaves the state's status set and a CallInfo pushed, so the frame it ran
+    // never comes back. `luaD_rawrunprotected` is the primitive underneath, so
+    // drive it directly with the same `f_call` thunk and a `CallS` of our own.
+    let rawprot = std::env::var("ZENO_RAWPROT").is_ok();
+    let calls_region = if rawprot {
+        let region = unsafe {
+            VirtualAllocEx(
+                handle,
+                std::ptr::null_mut(),
+                0x20,
+                MEM_COMMIT_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if region.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err("call struct allocation failed".into());
+        }
+        region as u64
+    } else {
+        0
+    };
+    let saved = std::rc::Rc::new(std::cell::Cell::new([0u64; 4]));
 
     let mut steps: Vec<Step> = Vec::new();
     for (position, _) in candidates.iter().enumerate() {
@@ -3766,9 +3804,24 @@ fn lua_classify(
             prepare: Box::new(move |_handle| Some([state, descriptor, name_slot as u64, 0])),
         });
         let slot_cell = call_slot.clone();
+        let saved_cell = saved.clone();
+        let call_label: &'static str = if rawprot {
+            "rawprot"
+        } else if protected {
+            "lua_pcall"
+        } else {
+            "luaD_call"
+        };
+        let call_rva = if rawprot {
+            LUA_RAWPROT_RVA
+        } else if protected {
+            LUA_PCALL_RVA
+        } else {
+            LUA_D_CALL_RVA
+        };
         steps.push(Step {
-            label: "luaD_call",
-            rva: LUA_D_CALL_RVA,
+            label: call_label,
+            rva: call_rva,
             absolute: false,
             prepare: Box::new(move |handle| {
                 if no_exec_requested() {
@@ -3781,54 +3834,74 @@ fn lua_classify(
                 let Some(closure) = read_bytes(handle, top - 16, 16) else {
                     return None;
                 };
-                // `luaD_call(L, funcslot, nresults, 0)` takes the slot holding
-                // the *function*, not the base of an argument list. Getting that
-                // one slot wrong hands the VM a nil and the frame unwinds into
-                // nowhere, so the two layouts below each name their own slot.
-                let call_base = if std::env::var("ZENO_PCALL").is_ok() {
-                    // Push the builtin pcall under the chunk so a raising
-                    // instruction lands in the error text, not the thread.
-                    let slot = top - 32;
-                    if !write_tvalue(handle, slot, pcall_value, LUA_TFUNCTION) {
-                        return None;
-                    }
-                    if !write_bytes_at(handle, slot + 16, &closure) {
-                        return None;
-                    }
-                    if !write_u64_at(handle, state + LUA_U64_TOP, slot + 32) {
-                        return None;
-                    }
-                    slot
-                } else {
-                    // Straight call on the chunk: function at top-16, top past it.
-                    if !write_bytes_at(handle, top - 16, &closure) {
-                        return None;
-                    }
-                    if !write_u64_at(handle, state + LUA_U64_TOP, top) {
-                        return None;
-                    }
-                    top - 16
-                };
-                let slot = call_base;
+                // Every entry point keeps the chunk closure in the slot the
+                // loader left it in and `top` just past it. They differ only in
+                // what the second register carries: a slot, an argument count,
+                // or a function pointer.
+                let slot = top - 16;
+                if !write_bytes_at(handle, slot, &closure) {
+                    return None;
+                }
+                if !write_u64_at(handle, state + LUA_U64_TOP, top) {
+                    return None;
+                }
+                // The protected call grows the stack, and a grown stack is a
+                // reallocated one: the address we arm is stale by the time the
+                // call returns. Carry the slot's offset from the stack instead
+                // and rebase it on the new stack when reading results.
+                let stack = read_u64(handle, state + LUA_U64_STACK);
                 if std::env::var("ZENO_STACK").is_ok() {
-                    let stack = read_u64(handle, state + LUA_U64_STACK);
                     let last = read_u64(handle, state + LUA_U64_STACK_LAST);
                     let base = read_u64(handle, state + 0x58);
+                    let status = read_u8_at(handle, state + LUA_U8_STATUS).unwrap_or(0xFF);
+                    let ncalls = read_u16_at(handle, state + 0x38).unwrap_or(0);
+                    let ci = read_u64(handle, state + 0x70);
+                    let is_c = read_u8_at(handle, read_u64(handle, slot) + CLOSURE_U8_IS_C);
                     println!(
-                        "classify   prep top 0x{top:X} slot 0x{slot:X} base 0x{base:X} stack 0x{stack:X} last 0x{last:X}"
+                        "classify   prep top 0x{top:X} slot 0x{slot:X} base 0x{base:X} stack 0x{stack:X} last 0x{last:X} status {status} ncalls {ncalls} ci 0x{ci:X} isC {is_c:?}"
                     );
                     println!("classify   prep slot[0] {}", describe_tvalue(handle, slot));
                     println!("classify   prep slot[1] {}", describe_tvalue(handle, slot + 16));
                 }
-                slot_cell.set(slot);
-                Some([state, slot, u64::MAX, 0])
+                slot_cell.set(slot.wrapping_sub(stack));
+                if rawprot {
+                    if !write_u64_at(handle, calls_region, slot) {
+                        return None;
+                    }
+                    if !write_u64_at(handle, calls_region + 8, u64::MAX) {
+                        return None;
+                    }
+                    // A raise leaves the CallInfo chain and the status byte
+                    // dirty, so remember them before the call and put them back
+                    // afterwards. `luaD_pcall` does the same on its error path.
+                    saved_cell.set([
+                        read_u64(handle, state + 0x70),
+                        read_u64(handle, state + 0x58),
+                        top,
+                        read_u8_at(handle, state + LUA_U8_STATUS).unwrap_or(0) as u64,
+                    ]);
+                    return Some([state, LUA_F_CALL_RVA, calls_region, 0]);
+                }
+                Some(if protected {
+                    [state, 0, u64::MAX, 0]
+                } else {
+                    [state, slot, u64::MAX, 0]
+                })
             }),
         });
     }
 
     let watch_index = index.clone();
     let watch_slot = call_slot.clone();
+    let watch_saved = saved.clone();
     let watch_candidates = candidates.clone();
+    let watch_label: &'static str = if rawprot {
+        "rawprot"
+    } else if protected {
+        "lua_pcall"
+    } else {
+        "luaD_call"
+    };
     let outcome = hijack_now_watch(
         pid,
         steps,
@@ -3836,30 +3909,61 @@ fn lua_classify(
         10,
         prefer,
         vec![(
-            "luaD_call",
+            watch_label,
             Box::new(move |handle| {
                 let current = watch_index.get();
                 let canonical = watch_candidates.get(current).copied().unwrap_or(0xFF);
-                // The state's base and top belong to whichever Lua thread is
-                // live, so read the slots this call actually armed instead:
-                // the chunk returns exactly four values from its function slot.
-                let slot = watch_slot.get();
-                let mut rendered = Vec::new();
-                if slot != 0 {
-                    for index in 0..4u64 {
-                        rendered.push(describe_tvalue(handle, slot + index * 16));
+                // A raise unwinds past `luaD_call` and leaves the CallInfo chain
+                // and the status byte pointing at the dead frame. Put back what
+                // the call started with before anything else touches the state.
+                if rawprot {
+                    let status = read_u8_at(handle, state + LUA_U8_STATUS).unwrap_or(0);
+                    if status != 0 {
+                        let before = watch_saved.get();
+                        write_u64_at(handle, state + 0x70, before[0]);
+                        write_u64_at(handle, state + 0x58, before[1]);
+                        write_u64_at(handle, state + LUA_U64_TOP, before[2]);
+                        write_bytes_at(handle, state + LUA_U8_STATUS, &[before[3] as u8]);
+                        println!("classify   0x{canonical:02X} -> raised, status {status} restored");
+                        watch_index.set(current + 1);
+                        return;
                     }
+                }
+                // The armed address is only valid until the call grows the
+                // stack. Rebase the offset we stored at arm time onto whatever
+                // stack the state holds now, and read the six result slots from
+                // there. A fresh stack with an out-of-range offset means the
+                // call never ran, so fall back to the raw armed address.
+                let stack = read_u64(handle, state + LUA_U64_STACK);
+                let last = read_u64(handle, state + LUA_U64_STACK_LAST);
+                let base = read_u64(handle, state + 0x58);
+                let offset = watch_slot.get();
+                let rebased = stack.wrapping_add(offset);
+                let slot = if offset < 0x4000 && rebased >= stack && rebased < last {
+                    rebased
+                } else {
+                    offset
+                };
+                let mut rendered = Vec::new();
+                for index in 0..6u64 {
+                    rendered.push(describe_tvalue(handle, slot + index * 16));
                 }
                 println!("classify   0x{canonical:02X} -> {}", rendered.join(" | "));
                 if std::env::var("ZENO_STACK").is_ok() {
-                    let stack = read_u64(handle, state + LUA_U64_STACK);
-                    let last = read_u64(handle, state + LUA_U64_STACK_LAST);
-                    let base = read_u64(handle, state + 0x58);
                     let top = read_u64(handle, state + LUA_U64_TOP);
-                    println!("classify       stack 0x{stack:X} last 0x{last:X} base 0x{base:X} top 0x{top:X} armed 0x{slot:X}");
+                    let status = read_u8_at(handle, state + LUA_U8_STATUS).unwrap_or(0xFF);
+                    let ncalls = read_u16_at(handle, state + 0x38).unwrap_or(0);
+                    let ci = read_u64(handle, state + 0x70);
+                    println!(
+                        "classify       stack 0x{stack:X} last 0x{last:X} base 0x{base:X} top 0x{top:X} off 0x{offset:X} used 0x{slot:X} status {status} ncalls {ncalls} ci 0x{ci:X}"
+                    );
                     let mut cursor = slot.saturating_sub(0x20);
-                    while cursor + 16 <= last && cursor < slot + 0x80 {
-                        println!("classify       [{:03X}] {}", cursor.wrapping_sub(slot), describe_tvalue(handle, cursor));
+                    while cursor + 16 <= last && cursor < slot + 0x60 {
+                        println!(
+                            "classify       [{:03X}] {}",
+                            cursor.wrapping_sub(slot),
+                            describe_tvalue(handle, cursor)
+                        );
                         cursor += 16;
                     }
                 }
