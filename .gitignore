@@ -15,3 +15,5 @@ tools/zeno-payload/target/
 .DS_Store
 tools/zeno-payload/.cargo/target/
 tools/zeno-hyperion/target/
+sample/
+tools/zeno-inject/test/*.bc

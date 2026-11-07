@@ -37,12 +37,13 @@ extern "system" {
         handle: Handle,
         attributes: *mut c_void,
         stack: usize,
-        start: extern "system" fn(*mut c_void) -> u32,
+        start: *mut c_void,
         parameter: *mut c_void,
         flags: u32,
         id: *mut u32,
     ) -> Handle;
     fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
+    fn TerminateThread(thread: Handle, code: u32) -> i32;
     fn ReadProcessMemory(
         handle: Handle,
         address: *const c_void,
@@ -1937,6 +1938,66 @@ fn sample_state(pid: u32, rva: u32, span: u64, seconds: u64) -> Result<(), Strin
                     registers[8], registers[9], registers[10], registers[11],
                     registers[12], registers[13], registers[14], registers[15]
                 );
+                // The interpreter keeps the instruction stream in r14 (code base)
+                // and the program counter in r15. Dumping both shows what real,
+                // working bytecode looks like — the ground truth for the mapping.
+                let code = registers[12];
+                let pc = registers[13];
+                if pc > 0x10000 {
+                    if let Some(bytes) = read_bytes(handle, pc.saturating_sub(8), 0x40) {
+                        let hx: Vec<String> =
+                            bytes.iter().map(|b| format!("{b:02X}")).collect();
+                        println!("sampler     pc 0x{pc:X} [-8..+0x38] {}", hx.join(" "));
+                    }
+                }
+                if code > 0x10000 && code != pc.saturating_sub(0) {
+                    if let Some(bytes) = read_bytes(handle, code, 0x40) {
+                        let hx: Vec<String> =
+                            bytes.iter().map(|b| format!("{b:02X}")).collect();
+                        println!("sampler     code 0x{code:X} {hx}", hx = hx.join(" "));
+                    }
+                }
+                // Which register actually points at the instruction stream? Score
+                // every pointer-looking register: a real code base is a run of
+                // dwords whose low byte is a live dispatch byte. The client's
+                // valid-dispatch table at +0x26933F4 is the oracle.
+                let mut valid = [false; 256];
+                if let Some(bytes) = read_bytes(handle, client.base + 0x26933F4, 254) {
+                    for (index, value) in bytes.iter().enumerate() {
+                        if *value != 0x5E {
+                            valid[index + 1] = true;
+                        }
+                    }
+                }
+                let mut best: Option<(usize, u64, u32)> = None;
+                for (index, value) in registers.iter().enumerate() {
+                    if *value < 0x10000 {
+                        continue;
+                    }
+                    for shift in 0..8u64 {
+                        let start = value.wrapping_sub(shift * 4);
+                        let Some(words) = read_bytes(handle, start, 0x40) else { continue };
+                        let mut score = 0u32;
+                        for chunk in words.chunks_exact(4) {
+                            if valid[chunk[0] as usize] {
+                                score += 1;
+                            }
+                        }
+                        if best.map_or(true, |(_, _, top)| score > top) {
+                            best = Some((index, start, score));
+                        }
+                    }
+                }
+                if let Some((index, start, score)) = best {
+                    println!(
+                        "sampler     codestream candidate reg[{index}] 0x{start:X} score {score}/16"
+                    );
+                    if let Some(bytes) = read_bytes(handle, start, 0x60) {
+                        let hx: Vec<String> =
+                            bytes.iter().map(|b| format!("{b:02X}")).collect();
+                        println!("sampler     stream {}", hx.join(" "));
+                    }
+                }
                 if state == 0 {
                     println!("sampler     no register carried a lua_State; r12 0x{r12:X} contents:");
                     dump_in(handle, r12, 0x40);
@@ -2029,12 +2090,194 @@ const PROTO_U64_CODE: u64 = 0x68;
 
 const TVAL_U64_VALUE: u64 = 0x0;
 const TVAL_I32_TT: u64 = 0xc;
-
+const PROTO_I32_SIZECODE: u64 = 0xa8;
 const EXTRA_U64_SHARED: u64 = 0x18;
 const SHARED_U64_HEAD: u64 = 0x8;
 const SHARED_U64_COUNT: u64 = 0x0;
 const SHARED_U64_SCRIPT_CONTEXT: u64 = 0x18;
 const SHARED_I32_THREADCOUNT: u64 = 0x20;
+
+/// Dumps the runtime opcode-dispatch table and checks a set of bytes against it.
+///
+/// The table in the on-disk image is a build-time placeholder: the client fills
+/// it at startup, so any verdict about "is this a legal dispatch byte" has to
+/// come from the live process, not the file.
+fn dump_opcode_table(pid: u32, probe: &[u8]) -> Result<(), String> {
+    let modules = modules_of(pid);
+    let client = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
+        .ok_or("client module not found")?;
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let Some(table) = read_bytes(handle, client.base + 0x26933F4, 254) else {
+        return Err("dispatch table unreadable".into());
+    };
+    let hex: Vec<String> = table.iter().map(|b| format!("{b:02X}")).collect();
+    println!("opmap       table {}", hex.join(" "));
+
+    let mut seen = [false; 256];
+    for byte in probe {
+        let index = *byte as usize;
+        let dense = if index >= 1 { table[index - 1] } else { 0x5E };
+        seen[index] = true;
+        println!(
+            "opmap       0x{byte:02X} -> table[{}] = 0x{dense:02X} {}",
+            index as i64 - 1,
+            if dense == 0x5E { "INVALID" } else { "ok" }
+        );
+    }
+
+    let mut invert = [0xFFu8; 256];
+    for (index, dense) in table.iter().enumerate() {
+        if *dense != 0x5E {
+            invert[*dense as usize] = (index + 1) as u8;
+        }
+    }
+    let inv: Vec<String> = invert[..94]
+        .iter()
+        .enumerate()
+        .map(|(dense, byte)| format!("{dense}:{byte:02X}"))
+        .collect();
+    println!("opmap       inverse {}", inv.join(" "));
+    let _ = seen;
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// The elevated helper is launched by `Start-Process -Verb RunAs`, which does not
+/// inherit the parent environment, so an env var alone cannot gate the run. A
+/// marker file next to the driver works regardless of how the process started.
+fn no_exec_requested() -> bool {
+    if std::env::var_os("ZENO_NO_EXEC").is_some() {
+        return true;
+    }
+
+    let path = std::env::temp_dir().join("opencode").join("zeno-payload").join("noexec.flag");
+    path.exists()
+}
+
+const BUILD_TO_VM_TABLE_V0: [(usize, u8); 12] = [
+    (0, 0xb2),
+    (1, 0x01),
+    (4, 0x72),
+    (5, 0x0e),
+    (6, 0x45),
+    (12, 0x02),
+    (18, 0x95),
+    (21, 0xe2),
+    (22, 0x57),
+    (53, 0xd7),
+    (64, 0x9a),
+    (65, 0x4a),
+];
+
+const BUILD_TO_VM_TABLE_V1: [(usize, u8); 12] = [
+    (0, 0x01),
+    (3, 0x72),
+    (4, 0x0e),
+    (5, 0x45),
+    (11, 0x02),
+    (17, 0x95),
+    (20, 0xe2),
+    (21, 0x57),
+    (52, 0xd7),
+    (63, 0x9a),
+    (64, 0x4a),
+    (193, 0x41),
+];
+
+/// The client rewrites each instruction's opcode byte during `luau_load`, so the
+/// byte a compiler has to emit is not the byte the VM dispatches on. That rewrite
+/// is a byte table built at startup — the pairs below were measured by loading
+/// probe chunks and reading `Proto::code` back. This scans the process for it.
+fn find_byte_map(pid: u32) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+
+    let mut address = 0x10000u64;
+    let mut info = [0u8; 48];
+    let mut scanned: u64 = 0;
+    let mut hits: Vec<(u64, usize, bool)> = Vec::new();
+    let chunk = 4u64 * 1024 * 1024;
+    let span = 0x100usize;
+
+    while address < 0x7FFF_FFFF_0000 {
+        let got = unsafe {
+            VirtualQueryEx(handle, address as *const c_void, info.as_mut_ptr() as *mut c_void, 48)
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+
+        let readable = state == 0x1000
+            && protect & 0x100 == 0
+            && matches!(protect & 0xFF, 0x02 | 0x04 | 0x06 | 0x08 | 0x20 | 0x40 | 0x80);
+        if readable && size <= 512 * 1024 * 1024 {
+            let mut cursor = 0u64;
+            let mut buffer = vec![0u8; chunk as usize + span];
+            while cursor < size {
+                let want = chunk.min(size - cursor);
+                let mut read = 0usize;
+                let ok = unsafe {
+                    ReadProcessMemory(
+                        handle,
+                        (base + cursor) as *const c_void,
+                        buffer.as_mut_ptr() as *mut c_void,
+                        want as usize,
+                        &mut read,
+                    )
+                };
+                if ok != 0 && read > span {
+                    let window = &buffer[..read];
+                    for i in 0..window.len() - span {
+                        if window[i] != 0xb2 && window[i] != 0x01 {
+                            continue;
+                        }
+                        if window[i] != 0xb2 {
+                            continue;
+                        }
+                        if BUILD_TO_VM_TABLE_V0
+                            .iter()
+                            .all(|(offset, value)| window[i + offset] == *value)
+                        {
+                            hits.push((base + cursor + i as u64, 0, false));
+                            println!("findmap      v0 table at 0x{:X}", base + cursor + i as u64);
+                        }
+                    }
+                    scanned += read as u64;
+                }
+                cursor += want;
+            }
+        }
+        address = base + size;
+        if address <= base {
+            break;
+        }
+    }
+
+    println!("findmap      scanned {:.1} MB in {pid}, {} hit(s)", scanned as f64 / 1_048_576.0, hits.len());
+    for (at, _, _) in &hits {
+        if let Some(table) = read_bytes(handle, *at, 256) {
+            let hex: Vec<String> = table[..160].iter().map(|b| format!("{b:02X}")).collect();
+            println!("findmap      0x{at:X}: {}", hex.join(" "));
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    let _ = BUILD_TO_VM_TABLE_V1;
+    Ok(())
+}
 
 /// `EB FE` filler in the client's `.text`, used as a parking lot: a hijacked
 /// thread that returns here spins without touching its stack, so the original
@@ -2042,7 +2285,8 @@ const SHARED_I32_THREADCOUNT: u64 = 0x20;
 const PARK_RVA: u64 = 0x4320D92;
 
 const LUA_TTHREAD: u8 = 8;
-const LUA_TFUNCTION: i32 = 6;
+// Roblox inserts LUA_TBUFFER at 7, so a function TValue carries tag 8.
+const LUA_TFUNCTION: i32 = 8;
 
 fn read_bytes(handle: Handle, address: u64, length: usize) -> Option<Vec<u8>> {
     let mut buffer = vec![0u8; length];
@@ -2292,6 +2536,12 @@ fn write_tvalue(handle: Handle, address: u64, value: u64, tag: i32) -> bool {
     write_bytes_at(handle, address, &raw)
 }
 
+fn read_cstring(handle: Handle, address: u64, limit: usize) -> Option<String> {
+    let bytes = read_bytes(handle, address, limit)?;
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).to_string())
+}
+
 fn read_tstring(handle: Handle, string: u64) -> String {
     if string < 0x10000 {
         return String::new();
@@ -2315,6 +2565,7 @@ fn wait_for_park(
 ) -> Option<[u64; 4]> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     let mut last = (0u64, 0u64);
+    let mut first: Option<u64> = None;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(8));
         unsafe { SuspendThread(thread) };
@@ -2326,6 +2577,9 @@ fn wait_for_park(
             let rsp = unsafe { *(probe.as_ptr().add(0x98) as *const u64) };
             let rax = unsafe { *(probe.as_ptr().add(0x78) as *const u64) };
             last = (rip, rsp);
+            if first.is_none() && rip != target {
+                first = Some(rip);
+            }
             if rip == park && rsp == stack_top {
                 return Some([rax, 0, 0, 0]);
             }
@@ -2333,7 +2587,7 @@ fn wait_for_park(
         unsafe { ResumeThread(thread) };
         if std::time::Instant::now() >= deadline {
             println!(
-                "run         gave up: last rip 0x{:X} (target+0x{:X}) rsp 0x{:X} (stack_top 0x{stack_top:X})",
+                "run         gave up: first non-target rip {first:?} last rip 0x{:X} (target+0x{:X}) rsp 0x{:X} (stack_top 0x{stack_top:X})",
                 last.0,
                 last.0.wrapping_sub(target),
                 last.1
@@ -2605,13 +2859,338 @@ fn remote_call(pid: u32, target_rva: u64, args: [u64; 4], wait_ms: u64) -> Resul
     )
 }
 
+/// Calls client functions from a brand new thread instead of stealing one.
+///
+/// A thread parked inside a kernel wait ignores everything the context API
+/// writes, so the only reliable window is a thread that has not started yet.
+/// CreateRemoteThread with CREATE_SUSPENDED gives exactly that: a real
+/// thread with a real stack, whose very first instruction is ours.
+/// Takes over a thread that is provably in user mode.
+///
+/// Every previous attempt resumed the thread before arming it, and a thread
+/// that resumes out of a kernel wait keeps its own trap frame: the context we
+/// write is thrown away. The only honest test is to inspect and act inside one
+/// suspension, and to require that RIP is inside the client image. A thread
+/// sitting in the game module is executing game code, not waiting.
+fn hijack_now(
+    pid: u32,
+    mut steps: Vec<Step>,
+    wait_ms: u64,
+    limit: usize,
+    prefer: Option<u32>,
+) -> Result<u64, String> {
+    hijack_now_watch(pid, steps, wait_ms, limit, prefer, Vec::new())
+}
+
+/// `watch` runs while the thread is still parked after the named step returns,
+/// which is the only moment the callee's results are guaranteed to be sitting
+/// on a stack nobody else is touching.
+fn hijack_now_watch(
+    pid: u32,
+    mut steps: Vec<Step>,
+    wait_ms: u64,
+    limit: usize,
+    prefer: Option<u32>,
+    watch: Vec<(&'static str, Box<dyn Fn(Handle)>)>,
+) -> Result<u64, String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let Some(client) = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
+    else {
+        unsafe { CloseHandle(handle) };
+        return Err("client module not found".into());
+    };
+    let client_base = client.base;
+    let client_end = client.base + client.size;
+    let park = client_base + PARK_RVA;
+    match read_bytes(handle, park, 2) {
+        Some(bytes) if bytes == [0xEB, 0xFE] => {}
+        other => {
+            unsafe { CloseHandle(handle) };
+            return Err(format!("park pad at {PARK_RVA:#X} is not EB FE: {other:?}"));
+        }
+    }
+
+    let mut last = String::from("no thread was executing client code");
+    let mut done = false;
+    let mut attempted = false;
+    let scan_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+    // A thread that was spinning in Luau a heartbeat ago can be asleep in a
+    // kernel wait by the time this runs, and none of the others are in the
+    // image either. Rescan instead of giving up on the first pass.
+    'scan: loop {
+    let mut tried = 0usize;
+    // The state belongs to one thread. Calling into the VM from any other
+    // thread races the owner while it keeps running, which corrupts the stack
+    // under our feet - so the owner is the only candidate, always.
+    let mut order = match prefer {
+        Some(preferred) => vec![preferred],
+        None => threads_of(pid),
+    };
+
+    for id in order {
+        if tried >= limit {
+            break;
+        }
+        let thread = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, id) };
+        if thread.is_null() {
+            continue;
+        }
+        unsafe { SuspendThread(thread) };
+        let mut original = vec![0u8; CONTEXT_SIZE];
+        unsafe { *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+        if unsafe { GetThreadContext(thread, original.as_mut_ptr() as *mut c_void) } == 0 {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            };
+            continue;
+        }
+        let rip = unsafe { *(original.as_ptr().add(CONTEXT_RIP_OFFSET) as *const u64) };
+        let rsp = unsafe { *(original.as_ptr().add(0x98) as *const u64) };
+        if rip < client_base || rip >= client_end || rip == park {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            };
+            continue;
+        }
+        tried += 1;
+        attempted = true;
+        println!(
+            "run         thread {id} executing at {} (rsp 0x{rsp:X})",
+            module_hit(&modules, rip)
+        );
+
+        // Win64 entry alignment: rsp % 16 == 8 at a function entry. An
+        // aligned resume slot makes every SSE spill in the callee fault.
+        // The margin is generous: the loader recurses through the parser and
+        // the GC, and a shallow slot faults deep inside it.
+        let resume_rsp = ((rsp - 0x4000) & !0xF) | 0x8;
+        let expected_rsp = resume_rsp + 8;
+        if !write_u64_at(handle, resume_rsp, park) {
+            unsafe {
+                ResumeThread(thread);
+                CloseHandle(thread);
+            };
+            continue;
+        }
+        let mut context = original.clone();
+        let mut failure: Option<String> = None;
+        for step in steps.iter_mut() {
+            let Some(args) = (step.prepare)(handle) else {
+                failure = Some(format!("{} aborted in prepare", step.label));
+                break;
+            };
+            let target = if step.absolute {
+                step.rva
+            } else {
+                client_base + step.rva
+            };
+            arm_context(&mut context, target, resume_rsp, args);
+            if unsafe { SetThreadContext(thread, context.as_ptr() as *const c_void) } == 0 {
+                failure = Some(format!("{}: SetThreadContext failed", step.label));
+                break;
+            }
+            unsafe { ResumeThread(thread) };
+            match wait_for_park(thread, target, park, expected_rsp, wait_ms) {
+                Some(registers) => println!(
+                    "run         {} parked, rax 0x{:X} ({})",
+                    step.label,
+                    registers[0],
+                    module_hit(&modules, registers[0])
+                ),
+                None => {
+                    failure = Some(format!("{} never reached the park pad", step.label));
+                    break;
+                }
+            }
+            for (label, hook) in watch.iter() {
+                if *label == step.label {
+                    hook(handle);
+                }
+            }
+            let mut current = vec![0u8; CONTEXT_SIZE];
+            unsafe { *(current.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+            if unsafe { GetThreadContext(thread, current.as_mut_ptr() as *mut c_void) } != 0 {
+                context = current;
+            }
+        }
+
+        unsafe {
+            SuspendThread(thread);
+            SetThreadContext(thread, original.as_ptr() as *const c_void);
+            ResumeThread(thread);
+        }
+        match failure {
+            None => {
+                println!("run         thread {id} restored");
+                done = true;
+                unsafe { CloseHandle(thread) };
+                break 'scan;
+            }
+            Some(message) => {
+                println!("run         thread {id}: {message}");
+                last = message;
+                unsafe { CloseHandle(thread) };
+            }
+        }
+    }
+        if done || (prefer.is_none() && attempted) || std::time::Instant::now() >= scan_deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    unsafe { CloseHandle(handle) };
+    if done {
+        Ok(park)
+    } else {
+        Err(last)
+    }
+}
+
+fn remote_thread_run(pid: u32, mut steps: Vec<Step>, wait_ms: u64) -> Result<u64, String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let Some(client) = modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(EXE))
+    else {
+        unsafe { CloseHandle(handle) };
+        return Err("client module not found".into());
+    };
+    let client_base = client.base;
+    let park = client_base + PARK_RVA;
+    match read_bytes(handle, park, 2) {
+        Some(bytes) if bytes == [0xEB, 0xFE] => {}
+        other => {
+            unsafe { CloseHandle(handle) };
+            return Err(format!("park pad at {PARK_RVA:#X} is not EB FE: {other:?}"));
+        }
+    }
+
+    let exit_thread = {
+        let ntdll = unsafe { GetModuleHandleW(wide("ntdll.dll").as_ptr()) };
+        if ntdll.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err("ntdll not loaded".into());
+        }
+        let address = unsafe { GetProcAddress(ntdll, b"RtlExitUserThread\0".as_ptr()) };
+        if address.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err("RtlExitUserThread not found".into());
+        }
+        address as u64
+    };
+
+    let mut thread_id = 0u32;
+    let thread = unsafe {
+        CreateRemoteThread(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            park as *mut c_void,
+            std::ptr::null_mut(),
+            0x4, // CREATE_SUSPENDED
+            &mut thread_id,
+        )
+    };
+    if thread.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err(format!("CreateRemoteThread failed ({})", unsafe { GetLastError() }));
+    }
+    println!(
+        "thread      spawned {thread_id}, park {} exit {}",
+        module_hit(&modules, park),
+        module_hit(&modules, exit_thread)
+    );
+
+    let mut original = vec![0u8; CONTEXT_SIZE];
+    unsafe { *(original.as_mut_ptr().add(CONTEXT_FLAGS_OFFSET) as *mut u32) = CONTEXT_FULL };
+    if unsafe { GetThreadContext(thread, original.as_mut_ptr() as *mut c_void) } == 0 {
+        unsafe {
+            TerminateThread(thread, 1);
+            CloseHandle(thread);
+            CloseHandle(handle);
+        }
+        return Err("GetThreadContext on the new thread failed".into());
+    }
+    let bootstrap_rsp = unsafe { *(original.as_ptr().add(0x98) as *const u64) };
+
+    let mut context = original.clone();
+    let mut failure: Option<String> = None;
+    for step in steps.iter_mut() {
+        let Some(args) = (step.prepare)(handle) else {
+            failure = Some(format!("{} aborted in prepare", step.label));
+            break;
+        };
+        let target = if step.absolute {
+            step.rva
+        } else {
+            client_base + step.rva
+        };
+        let resume_rsp = (bootstrap_rsp - 0x800) & !0xF;
+        if !write_u64_at(handle, resume_rsp, park) {
+            failure = Some("stack write failed".to_string());
+            break;
+        }
+        arm_context(&mut context, target, resume_rsp, args);
+        if unsafe { SetThreadContext(thread, context.as_ptr() as *const c_void) } == 0 {
+            failure = Some(format!("{}: SetThreadContext failed", step.label));
+            break;
+        }
+        unsafe { ResumeThread(thread) };
+        match wait_for_park(thread, target, park, resume_rsp + 8, wait_ms) {
+            Some(registers) => println!(
+                "thread      {} parked, rax 0x{:X}",
+                step.label, registers[0]
+            ),
+            None => {
+                let mut code = 0u32;
+                let got = unsafe { GetExitCodeThread(thread, &mut code) };
+                failure = Some(format!(
+                    "{} never returned (exit code query {got}, code 0x{code:X})",
+                    step.label
+                ));
+                break;
+            }
+        }
+    }
+
+    // Leave through RtlExitUserThread rather than parking forever: a spinning
+    // thread inside the client is a thread the anti-tamper walk can see.
+    unsafe {
+        arm_context(&mut context, exit_thread, bootstrap_rsp, [0; 4]);
+        SetThreadContext(thread, context.as_ptr() as *const c_void);
+        ResumeThread(thread);
+        WaitForSingleObject(thread, 2000);
+        CloseHandle(thread);
+        CloseHandle(handle);
+    }
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(park),
+    }
+}
+
 const LUA_D_CALL_RVA: u64 = 0x26361C0;
 const LUA_LOAD_RVA: u64 = 0x426A570;
+const LUA_COMPILE_RVA: u64 = 0x426A1F0;
 
 /// Loads a script with the client's own `luau_load` and runs it through the
 /// client's own `pcall` closure, so a script error unwinds through Roblox's
 /// handler instead of escaping into the hijacked thread.
-fn lua_exec(pid: u32, state: u64, script: &std::path::Path) -> Result<(), String> {
+fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>) -> Result<(), String> {
     let source = std::fs::read(script).map_err(|e| format!("{}: {e}", script.display()))?;
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
@@ -2655,32 +3234,64 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path) -> Result<(), String
     let string_ok = write_bytes_at(handle, string_slot as u64, &descriptor);
     let buffer_ok = write_bytes_at(handle, buffer_slot as u64, &source);
     let name_ok = write_bytes_at(handle, name_slot as u64, chunkname);
-    unsafe { CloseHandle(handle) };
     if !string_ok || !buffer_ok || !name_ok {
+        unsafe { CloseHandle(handle) };
         return Err("argument write failed".into());
     }
     println!(
         "exec        staged string 0x{:X} -> buffer 0x{:X} ({source_size} bytes, cap {source_capacity}) name 0x{:X}",
         string_slot as u64, buffer_slot as u64, name_slot as u64
     );
+    if let Some(client) = modules_of(pid).iter().find(|m| m.name.eq_ignore_ascii_case(EXE)) {
+        println!(
+            "exec        loader compile-flag byte {}",
+            read_u8_at(handle, client.base + 0x81967B0).unwrap_or(0xFF)
+        );
+    }
 
     let slot = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    let load_slot = slot.clone();
 
     let mut steps: Vec<Step> = Vec::new();
+    // The loader takes a container, not source: eight magic bytes followed by
+    // raw Luau bytecode. A leaf call parks first so a failure here is
+    // unambiguous about which side is broken.
+    let sleep_address = {
+        let kernel32 = unsafe { GetModuleHandleW(wide("kernel32.dll").as_ptr()) };
+        if kernel32.is_null() {
+            0
+        } else {
+            unsafe { GetProcAddress(kernel32, b"Sleep\\0".as_ptr()) as u64 }
+        }
+    };
+    println!("exec        leaf target 0x{sleep_address:X}");
+    if sleep_address != 0 {
+        steps.push(Step {
+            label: "probe_sleep",
+            rva: sleep_address,
+            absolute: true,
+            prepare: Box::new(|_handle| Some([1, 0, 0, 0])),
+        });
+    }
     steps.push(Step {
         label: "luau_load",
         rva: LUA_LOAD_RVA,
         absolute: false,
         prepare: Box::new(move |_handle| {
+            println!("exec        loading {source_size} bytes at 0x{:X}", string_slot as u64);
             Some([state, string_slot as u64, name_slot as u64, 0])
         }),
     });
+    let call_slot = slot.clone();
+    let result_slot = slot.clone();
     steps.push(Step {
         label: "luaD_call",
         rva: LUA_D_CALL_RVA,
         absolute: false,
         prepare: Box::new(move |handle| {
+            if no_exec_requested() {
+                println!("exec        noexec set, skipping the call");
+                return None;
+            }
             let top = read_u64_checked(handle, state + LUA_U64_TOP)?;
             if top < 32 {
                 println!("exec        top 0x{top:X} is implausible");
@@ -2698,54 +3309,296 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path) -> Result<(), String
                 println!("exec        compile error: {}", read_tstring(handle, value));
                 return None;
             }
-            if tag != LUA_TFUNCTION || pcall == 0 {
+            if tag != LUA_TFUNCTION {
                 return None;
             }
-            if !write_tvalue(handle, function_slot, pcall, LUA_TFUNCTION) {
+            // Call the chunk directly. Wrapping it in the builtin `pcall` adds a
+            // second unknown (the builtin's own calling convention) on top of the
+            // bytecode, and this chunk cannot throw.
+            if !write_tvalue(handle, function_slot, value, LUA_TFUNCTION) {
                 return None;
             }
-            if !write_tvalue(handle, function_slot + 16, value, LUA_TFUNCTION) {
+            if !write_u64_at(handle, state + LUA_U64_TOP, function_slot + 16) {
                 return None;
             }
-            if !write_u64_at(handle, state + LUA_U64_TOP, function_slot + 32) {
-                return None;
-            }
-            load_slot.set(function_slot);
+            call_slot.set(function_slot);
             Some([state, function_slot, u64::MAX, 0])
         }),
     });
 
-    let outcome = remote_run(pid, steps, 20000);
+    let outcome = hijack_now_watch(
+        pid,
+        steps,
+        20000,
+        10,
+        prefer,
+        vec![
+            (
+                "luau_load",
+                Box::new(move |handle| {
+                    let top = read_u64(handle, state + LUA_U64_TOP);
+                    let closure = read_u64(handle, top - 16);
+                    println!("exec        closure 0x{closure:X}");
+                    if let Some(head) = read_bytes(handle, closure, 0x80) {
+                        for row in 0..8 {
+                            let chunk = &head[row * 16..row * 16 + 16];
+                            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+                            println!("exec        closure+{:02X}: {}", row * 16, hex.join(" "));
+                        }
+                    }
+                    for off in (0..0x80u64).step_by(8) {
+                        let candidate = read_u64(handle, closure + off);
+                        if candidate < 0x10000 {
+                            continue;
+                        }
+                        let sizecode = read_i32_at(handle, candidate + PROTO_I32_SIZECODE).unwrap_or(-1);
+                        let code = read_u64(handle, candidate + PROTO_U64_CODE);
+                        if code < 0x10000 || !(0..=4096).contains(&sizecode) {
+                            continue;
+                        }
+                        let Some(words) = read_bytes(handle, code, 0x800) else { continue };
+                        let take = ((sizecode as usize) * 4).min(words.len());
+                        let hex: Vec<String> =
+                            words[..take].iter().map(|b| format!("{b:02X}")).collect();
+                        println!(
+                            "exec        proto via +{off:02X} 0x{candidate:X} sizecode {sizecode} code 0x{code:X} [{}]",
+                            hex.join(" ")
+                        );
+                        for field in [0x50u64, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80] {
+                            let p = read_u64(handle, candidate + field);
+                            if p < 0x10000 {
+                                println!("exec        proto+{field:02X} = 0x{p:X} (small)");
+                                continue;
+                            }
+                            match read_bytes(handle, p, 0x20) {
+                                Some(head) => {
+                                    let hx: Vec<String> =
+                                        head.iter().map(|b| format!("{b:02X}")).collect();
+                                    println!("exec        proto+{field:02X} -> 0x{p:X} [{}]", hx.join(" "));
+                                }
+                                None => println!("exec        proto+{field:02X} -> 0x{p:X} (unreadable)"),
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "luaD_call",
+                Box::new(move |handle| {
+                    let base = result_slot.get();
+                    let top = read_u64(handle, state + LUA_U64_TOP);
+                    println!(
+                        "exec        capture base 0x{base:X} top 0x{top:X} delta 0x{:X}",
+                        top.wrapping_sub(base)
+                    );
+                    let l_base = read_u64(handle, state + 0x58);
+                    let ci = read_u64(handle, state + 0x70);
+                    let stack = read_u64(handle, state + LUA_U64_STACK);
+                    let last = read_u64(handle, state + LUA_U64_STACK_LAST);
+                    let status = read_bytes(handle, state, 8)
+                        .map(|b| b.iter().map(|v| format!("{v:02X}")).collect::<Vec<_>>().join(" "))
+                        .unwrap_or_default();
+                    println!(
+                        "exec        state base 0x{l_base:X} ci 0x{ci:X} stack 0x{stack:X} last 0x{last:X} hdr {status}"
+                    );
+                    for back in 1..=8u64 {
+                        let slot = top - 0x10 * back;
+                        let value = read_u64(handle, slot);
+                        let tag = read_i32_at(handle, slot + TVAL_I32_TT).unwrap_or(-1);
+                        let text = if tag == 5 { read_tstring(handle, value) } else { String::new() };
+                        println!("exec        top-{back} 0x{slot:X} tag {tag} value 0x{value:X} {text}");
+                    }
+                    let mut cursor = base;
+                    let mut index = 0;
+                    while cursor + 16 <= top && index < 12 {
+                        let value = read_u64(handle, cursor);
+                        let tag = read_i32_at(handle, cursor + TVAL_I32_TT).unwrap_or(-1);
+                        let rendered = match tag {
+                            0 => "nil".to_string(),
+                            1 => format!("boolean {}", value != 0),
+                            3 => format!("number {}", f64::from_bits(value)),
+                            4 => format!("vector 0x{value:X}"),
+                            5 => format!("string {:?}", read_tstring(handle, value)),
+                            6 => format!("table 0x{value:X}"),
+                            8 => format!("function 0x{value:X}"),
+                            9 => format!("userdata 0x{value:X}"),
+                            10 => format!("thread 0x{value:X}"),
+                            other => format!("tag {other} value 0x{value:X}"),
+                        };
+                        println!("exec        out[{index}] {rendered}");
+                        cursor += 16;
+                        index += 1;
+                    }
+                }),
+            ),
+        ],
+    );
     let base = slot.get();
 
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
-    if !handle.is_null() && handle != -1isize as Handle && base != 0 {
-        let top = read_u64(handle, state + LUA_U64_TOP);
-        println!("exec        returned, top 0x{top:X} from 0x{base:X}");
-        let mut cursor = base;
-        let mut index = 0;
-        while cursor + 16 <= top && index < 16 {
-            let value = read_u64(handle, cursor);
-            let tag = read_i32_at(handle, cursor + TVAL_I32_TT).unwrap_or(-1);
-            let rendered = match tag {
-                0 => "nil".to_string(),
-                1 => format!("boolean {}", value != 0),
-                3 => format!("number {}", f64::from_bits(value)),
-                4 => format!("string {:?}", read_tstring(handle, value)),
-                5 => format!("table 0x{value:X}"),
-                6 => format!("function 0x{value:X}"),
-                8 => format!("thread 0x{value:X}"),
-                other => format!("tag {other} value 0x{value:X}"),
-            };
-            println!("exec        result[{index}] {rendered}");
-            cursor += 16;
-            index += 1;
-        }
+    if !handle.is_null() && handle != -1isize as Handle {
         // The host thread was suspended with its own top; put it back.
-        write_u64_at(handle, state + LUA_U64_TOP, base);
+        if base != 0 {
+            write_u64_at(handle, state + LUA_U64_TOP, base);
+        }
         unsafe { CloseHandle(handle) };
     }
     outcome.map(|_| ())
+}
+
+const PROBE_MAGIC: [u8; 8] = [0x52, 0x7A, 0x10, 0x4A, 0x5B, 0x32, 0x09, 0xE0];
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// The loader behind this client's `LuaVMLoad` takes a container: eight magic
+/// bytes, then a version-14 Luau blob with one proto. Everything after
+/// `protoSize` is skipped, so a one-instruction proto stays tiny.
+fn probe_blob(words: &[u32], maxstack: u8) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[maxstack, 0, 0, 0, 0]);
+    write_varint(&mut body, 0); // typesize
+    write_varint(&mut body, words.len() as u64);
+    for word in words {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    write_varint(&mut body, 0); // sizek
+    write_varint(&mut body, 0); // sizep
+    write_varint(&mut body, 0); // linedefined
+    write_varint(&mut body, 0); // debugname
+    body.push(0); // lineinfo
+    body.push(0); // debuginfo
+    write_varint(&mut body, 0); // feedback vector size
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&PROBE_MAGIC);
+    blob.extend_from_slice(&[14, 3]);
+    write_varint(&mut blob, 0); // string count
+    blob.push(0); // userdata remap terminator
+    write_varint(&mut blob, 1); // proto count
+    write_varint(&mut blob, body.len() as u64);
+    blob.extend_from_slice(&body);
+    write_varint(&mut blob, 0); // main proto id
+    blob
+}
+
+/// Loads one one-instruction chunk per encoded byte and reads the proto back.
+/// The loader rewrites the opcode byte in place, so a successful load yields the
+/// encoded -> dispatch byte the VM actually dispatches on. Nothing is executed.
+fn lua_scan(pid: u32, state: u64, prefer: Option<u32>) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let blob_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    let string_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    let name_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    if blob_slot.is_null() || string_slot.is_null() || name_slot.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("probe allocation failed".into());
+    }
+
+    let template = probe_blob(&[0], 3);
+    let size = template.len();
+    let capacity = size + 1;
+    let mut descriptor = vec![0u8; 0x20];
+    descriptor[0x0..0x8].copy_from_slice(&(blob_slot as u64).to_le_bytes());
+    descriptor[0x10..0x18].copy_from_slice(&(size as u64).to_le_bytes());
+    descriptor[0x18..0x20].copy_from_slice(&(capacity as u64).to_le_bytes());
+    if !write_bytes_at(handle, string_slot as u64, &descriptor)
+        || !write_bytes_at(handle, name_slot as u64, b"=scan\0")
+    {
+        unsafe { CloseHandle(handle) };
+        return Err("probe descriptor write failed".into());
+    }
+    println!("scan        blob {size} bytes, blob slot 0x{:X}", blob_slot as u64);
+
+    let cursor = std::rc::Rc::new(std::cell::Cell::new(0u8));
+    let top_before = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let mut steps: Vec<Step> = Vec::new();
+    for byte in 0u8..=255 {
+        let shape = probe_blob(&[byte as u32], 3);
+        let cursor = cursor.clone();
+        let top_before = top_before.clone();
+        steps.push(Step {
+            label: "scan",
+            rva: LUA_LOAD_RVA,
+            absolute: false,
+            prepare: Box::new(move |handle| {
+                if !write_bytes_at(handle, blob_slot as u64, &shape) {
+                    return None;
+                }
+                cursor.set(byte);
+                top_before.set(read_u64(handle, state + LUA_U64_TOP));
+                Some([state, string_slot as u64, name_slot as u64, 0])
+            }),
+        });
+    }
+
+    let watch_cursor = cursor.clone();
+    let watch_top = top_before.clone();
+    let result = hijack_now_watch(
+        pid,
+        steps,
+        20000,
+        10,
+        prefer,
+        vec![(
+            "scan",
+            Box::new(move |handle| {
+                let byte = watch_cursor.get();
+                let top = read_u64(handle, state + LUA_U64_TOP);
+                let slot = top.wrapping_sub(16);
+                let value = read_u64(handle, slot);
+                let tag = read_i32_at(handle, slot + TVAL_I32_TT).unwrap_or(-1);
+                if tag == LUA_TFUNCTION {
+                    let mut rendered = String::from("no proto");
+                    for off in (0..0x80u64).step_by(8) {
+                        let candidate = read_u64(handle, value + off);
+                        if candidate < 0x10000 {
+                            continue;
+                        }
+                        let sizecode =
+                            read_i32_at(handle, candidate + PROTO_I32_SIZECODE).unwrap_or(-1);
+                        let code = read_u64(handle, candidate + PROTO_U64_CODE);
+                        if code < 0x10000 || sizecode != 1 {
+                            continue;
+                        }
+                        if let Some(words) = read_bytes(handle, code, 8) {
+                            let word = u32::from_le_bytes(words[0..4].try_into().unwrap());
+                            rendered = format!("word 0x{word:08X} (low 0x{:02X})", word & 0xFF);
+                        }
+                        break;
+                    }
+                    println!("scan        0x{byte:02X} -> {rendered}");
+                } else {
+                    let text = if tag == 5 { read_tstring(handle, value) } else { String::new() };
+                    println!("scan        0x{byte:02X} rejected tag {tag} {text}");
+                }
+                let before = watch_top.get();
+                if before >= 0x10000 {
+                    write_u64_at(handle, state + LUA_U64_TOP, before);
+                }
+            }),
+        )],
+    );
+    unsafe { CloseHandle(handle) };
+    result.map(|_| ())
 }
 
 fn image_test(
@@ -3098,7 +3951,13 @@ fn main() -> Result<(), String> {
     let mut dump: Option<(u32, u64, usize)> = None;
     let mut vminfo: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
+    let mut xthread: Option<(u64, [u64; 4], u64)> = None;
+    let mut hijack_now_opts: Option<(u64, [u64; 4], u64)> = None;
+    let mut forced_thread: Option<u32> = None;
     let mut execute: Option<(u64, PathBuf)> = None;
+    let mut scan_state: Option<u64> = None;
+    let mut findmap = false;
+    let mut opmap_probe: Option<Vec<u8>> = None;
     let mut carrier: Option<String> = None;
     let mut use_existing = false;
     let mut mode: u64 = 1;
@@ -3187,6 +4046,43 @@ fn main() -> Result<(), String> {
                         .map_err(|_| format!("bad address {value}"))?,
                 );
             }
+            flag @ ("--xthread" | "--hijacknow") => {
+                let value = argv.next().ok_or("--xthread needs an rva")?;
+                let rva = if let Some(symbol) = value.strip_prefix("@") {
+                    let (module, export) = symbol
+                        .split_once('!')
+                        .ok_or_else(|| format!("bad symbol {symbol}"))?;
+                    let base = unsafe { GetModuleHandleW(wide(module).as_ptr()) };
+                    if base.is_null() {
+                        return Err(format!("{module} is not loaded here"));
+                    }
+                    let address = unsafe { GetProcAddress(base, export.as_ptr()) };
+                    if address.is_null() {
+                        return Err(format!("{symbol} not found"));
+                    }
+                    address as u64
+                } else {
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad rva {value}"))?
+                };
+                let mut call_args = [0u64; 4];
+                for slot in call_args.iter_mut() {
+                    let text = argv.next().ok_or("--xthread needs four hex arguments")?;
+                    *slot = u64::from_str_radix(text.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad argument {text}"))?;
+                }
+                let wait_ms = match argv.next() {
+                    Some(text) => text
+                        .parse::<u64>()
+                        .map_err(|_| format!("bad wait {text}"))?,
+                    None => 8000,
+                };
+                if flag == "--hijacknow" {
+                    hijack_now_opts = Some((rva, call_args, wait_ms));
+                } else {
+                    xthread = Some((rva, call_args, wait_ms));
+                }
+            }
             "--xcall" => {
                 let value = argv.next().ok_or("--xcall needs an rva")?;
                 let rva = if let Some(symbol) = value.strip_prefix("@") {
@@ -3222,8 +4118,32 @@ fn main() -> Result<(), String> {
                 };
                 xcall = Some((rva, call_args, wait_ms));
             }
-            "--exec" => {
-                let value = argv.next().ok_or("--exec needs a lua_State address")?;
+            "--thread" => {
+                let value = argv.next().ok_or("--thread needs a thread id")?;
+                forced_thread = Some(
+                    u32::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad thread id {value}"))?,
+                );
+            }
+            "--findmap" => findmap = true,
+            "--opmap" => {
+                let text = argv.next().ok_or("--opmap needs hex bytes")?;
+                let mut bytes = Vec::new();
+                for piece in text.split([',', ' ', ':']).filter(|p| !p.is_empty()) {
+                    let value = u8::from_str_radix(piece.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad byte {piece}"))?;
+                    bytes.push(value);
+                }
+                opmap_probe = Some(bytes);
+            }
+            "--scan" => {
+                let value = argv.next().ok_or("--scan needs a lua_State address")?;
+                scan_state = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad address {value}"))?;
                 let script = PathBuf::from(argv.next().ok_or("--exec needs a script path")?);
@@ -3284,6 +4204,40 @@ fn main() -> Result<(), String> {
         return vm_info(target, state);
     }
 
+    if let Some((rva, call_args, wait_ms)) = hijack_now_opts {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let outcome = hijack_now(
+            target,
+            vec![Step {
+                label: "hijacknow",
+                rva,
+                absolute: rva >= 0x7FF0_0000_0000,
+                prepare: Box::new(move |_handle| Some(call_args)),
+            }],
+            wait_ms,
+            10,
+            forced_thread,
+        );
+        println!("hijack      done: {outcome:?}");
+        return outcome.map(|_| ());
+    }
+
+    if let Some((rva, call_args, wait_ms)) = xthread {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let outcome = remote_thread_run(
+            target,
+            vec![Step {
+                label: "xthread",
+                rva,
+                absolute: rva >= 0x7FF0_0000_0000,
+                prepare: Box::new(move |_handle| Some(call_args)),
+            }],
+            wait_ms,
+        );
+        println!("thread      done: {outcome:?}");
+        return outcome.map(|_| ());
+    }
+
     if let Some((rva, call_args, wait_ms)) = xcall {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         let park = remote_call(target, rva, call_args, wait_ms)?;
@@ -3291,9 +4245,24 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    if findmap {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_byte_map(target);
+    }
+
+    if let Some(bytes) = opmap_probe {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return dump_opcode_table(target, &bytes);
+    }
+
+    if let Some(state) = scan_state {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return lua_scan(target, state, forced_thread);
+    }
+
     if let Some((state, script)) = execute {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
-        return lua_exec(target, state, &script);
+        return lua_exec(target, state, &script, forced_thread);
     }
 
     if let Some((target, address, length)) = dump {
@@ -3820,7 +4789,7 @@ fn main() -> Result<(), String> {
                 handle,
                 std::ptr::null_mut(),
                 0,
-                start,
+                start as *mut c_void,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
@@ -3919,7 +4888,7 @@ fn main() -> Result<(), String> {
             handle,
             std::ptr::null_mut(),
             0,
-            start,
+            start as *mut c_void,
             remote,
             0,
             std::ptr::null_mut(),

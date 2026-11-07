@@ -39,8 +39,7 @@
   },
   "rva": {
     "Print": "0x1ca9a30",
-    "OpcodeLookupTable": "0x735b280",
-    "ScriptContextResume": "0x431b1f0",
+    "OpcodeLookupTable": "0x735b280",    "ScriptContextResume": "0x431b1f0",
     "GetLuaStateForInstance": "0x4274c30",
     "GetLuaStateForInstanceAlt": "0x4274c90",
     "LuaVMLoad": "0x426a570",
@@ -58,7 +57,11 @@
     "GetCapabilities": "0x1cea140",
     "GetFFlag": "0x4b12b50",
     "SetFFlag": "0x4b12050",
-    "park_pad": "0x4320d92"
+    "park_pad": "0x4320d92",
+    "Luau.OpcodeDispatchTable": "0x26933f4",
+    "Luau.OpcodeDispatchOffsets": "0x2693278",
+    "Luau.OpcodeSentinel": "0x5e",
+    "Luau.BytecodeVersion": "14"
   },
   "structs": {
     "lua_State.size": "0x88",
