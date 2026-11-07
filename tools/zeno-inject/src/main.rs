@@ -6,8 +6,14 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod map;
+
+/// Run chunks through `lua_pcall` instead of a bare `luaD_call`. A raising
+/// opcode then comes back as an error value instead of unwinding the hijacked
+/// thread into the client's own `errorJmp`.
+static PROTECT: AtomicBool = AtomicBool::new(false);
 
 type Handle = *mut c_void;
 
@@ -3864,9 +3870,17 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
     });
     let call_slot = slot.clone();
     let result_slot = slot.clone();
+    // A direct `luaD_call` runs the chunk unprotected: one raising opcode
+    // unwinds through whatever `errorJmp` the hijacked thread happens to
+    // carry and takes the client with it. `lua_pcall` wraps the same call in
+    // `luaD_rawrunprotected`, so a raise comes back as a status plus the error
+    // value on the stack. That error value is the whole point: it names the
+    // opcode that failed.
+    let protected = PROTECT.load(Ordering::Relaxed) || std::env::var("ZENO_PCALL").is_ok();
+    let call_label: &'static str = if protected { "lua_pcall" } else { "luaD_call" };
     steps.push(Step {
-        label: "luaD_call",
-        rva: LUA_D_CALL_RVA,
+        label: call_label,
+        rva: if protected { LUA_PCALL_RVA } else { LUA_D_CALL_RVA },
         absolute: false,
         prepare: Box::new(move |handle| {
             if no_exec_requested() {
@@ -3921,7 +3935,11 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                 return None;
             }
             call_slot.set(function_slot);
-            Some([state, function_slot, u64::MAX, 0])
+            if protected {
+                Some([state, 0, u64::MAX, 0])
+            } else {
+                Some([state, function_slot, u64::MAX, 0])
+            }
         }),
     });
 
@@ -3991,7 +4009,7 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                 }),
             ),
             (
-                "luaD_call",
+                call_label,
                 Box::new(move |handle| {
                     let base = result_slot.get();
                     let top = read_u64(handle, state + LUA_U64_TOP);
@@ -5133,6 +5151,9 @@ fn main() -> Result<(), String> {
                     *to = u8::from_str_radix(value.trim_start_matches("0x"), 16)
                         .map_err(|_| format!("bad byte {value}"))?;
                 }
+            }
+            "--protect" => {
+                PROTECT.store(true, Ordering::Relaxed);
             }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)

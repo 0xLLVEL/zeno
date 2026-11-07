@@ -56,9 +56,15 @@ def build_opmap():
 
     `opmap_guess.json` is keyed by LOP name and holds the byte the client's
     loader expects in the blob. The compiler reads a 256-byte table indexed by
-    LOP number, so reorder it here. NEWCLOSURE is derived by elimination: 94
-    dispatch bytes are valid and 93 names are measured, so the one unclaimed
-    dispatch byte (0xC7) belongs to the one unmeasured implemented opcode.
+    LOP number, so reorder it here.
+
+    Every byte in the file is now derived from the client image, not guessed:
+    the loader's rewrite table (rva 0x735B280) maps a canonical byte to the
+    interpreter's dispatch byte, and `SC` (rva 0x735B380, indexed by dispatch
+    byte) yields the LOP number the interpreter implements for it. Inverting
+    `SC[T[c]]` therefore names all 94 implemented opcodes exactly. The only
+    upstream LOP with no handler is CAPTURE, which is analysis-only and never
+    emitted into a loadable chunk.
     """
     import json
 
@@ -68,8 +74,6 @@ def build_opmap():
         entry = measured.get(name)
         if entry is not None:
             table[index] = entry["byte"]
-    if "NEWCLOSURE" not in measured:
-        table[LOP_ORDER.index("NEWCLOSURE")] = 0x73
     with open(OPMAP, "wb") as f:
         f.write(bytes(table))
     return OPMAP
