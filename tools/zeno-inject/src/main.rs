@@ -2561,7 +2561,7 @@ fn describe_tvalue(handle: Handle, slot: u64) -> String {
     let tag = read_i32_at(handle, slot + TVAL_I32_TT).unwrap_or(-1);
     match tag {
         0 => "nil".to_string(),
-        1 => format!("boolean {}", value != 0),
+        1 => format!("boolean raw 0x{value:X} extra 0x{:X}", read_u64(handle, slot + 8)),
         3 => format!("number {}", f64::from_bits(value)),
         4 => format!("vector 0x{value:X}"),
         5 | 6 if value < 0x10000 => format!("string (null) tag {tag}"),
@@ -3618,6 +3618,259 @@ fn lua_scan(pid: u32, state: u64, prefer: Option<u32>) -> Result<(), String> {
     result.map(|_| ())
 }
 
+/// Probe blob for a single canonical opcode byte.
+///
+/// Four `LOADN`s seed R0..R3 with known numbers, then the candidate runs, then a
+/// zero word, then `RETURN R0,4`. Canonical 0x00 is `NOP` and one word wide, so
+/// that zero word is either the candidate's aux or a harmless filler, and a
+/// branch with a zero displacement falls through to it instead of looping. The
+/// constant table is seeded so an operand reading `k[0]` sees a number instead
+/// of a wild pointer.
+fn classify_blob(canonical: u8) -> Vec<u8> {
+    const OP_LOADN: u32 = 0x8C;
+    const OP_RETURN: u32 = 0x82;
+    let loadn = |a: u32, d: u32| OP_LOADN | (a << 8) | (d << 16);
+    let words = [
+        loadn(0, 7),
+        loadn(1, 9),
+        loadn(2, 0),
+        loadn(3, 0),
+        canonical as u32,
+        0,
+        OP_RETURN | (0 << 8) | (5 << 16),
+    ];
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[8, 0, 0, 0, 0]);
+    write_varint(&mut body, 0); // typesize
+    write_varint(&mut body, words.len() as u64);
+    for word in words {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    write_varint(&mut body, 4); // sizek
+    body.push(2); // number
+    body.extend_from_slice(&7.0f64.to_le_bytes());
+    body.push(2);
+    body.extend_from_slice(&9.0f64.to_le_bytes());
+    body.push(3);
+    write_varint(&mut body, 1); // string, table index 1
+    body.push(1); // boolean
+    body.push(1);
+    write_varint(&mut body, 0); // sizep
+    write_varint(&mut body, 0); // linedefined
+    write_varint(&mut body, 0); // debugname
+    body.push(0); // lineinfo
+    body.push(0); // debuginfo
+    write_varint(&mut body, 0); // feedback vector size
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&PROBE_MAGIC);
+    blob.extend_from_slice(&[14, 3]);
+    write_varint(&mut blob, 1); // string count
+    write_varint(&mut blob, 4);
+    blob.extend_from_slice(b"zeno");
+    blob.push(0); // userdata remap terminator
+    write_varint(&mut blob, 1); // proto count
+    write_varint(&mut blob, body.len() as u64);
+    blob.extend_from_slice(&body);
+    write_varint(&mut blob, 0); // main proto id
+    blob
+}
+
+/// Runs one candidate opcode per chunk, each wrapped in the client's own
+/// `pcall`, and prints the registers it left behind or the error it raised.
+/// The error text is the classification: "attempt to index" is a table read,
+/// "attempt to compare" is a branch, and a clean return means the instruction
+/// only touched its own registers.
+fn lua_classify(
+    pid: u32,
+    state: u64,
+    from: u8,
+    to: u8,
+    prefer: Option<u32>,
+) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let candidates: Vec<u8> = (from..=to).collect();
+    let count = candidates.len();
+
+    let blob_region = unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            count * 0x400,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    let desc_region = unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            count * 0x20,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    let name_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    if blob_region.is_null() || desc_region.is_null() || name_slot.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("argument allocation failed".into());
+    }
+    let blob_base = blob_region as u64;
+    let desc_base = desc_region as u64;
+
+    for (index, canonical) in candidates.iter().enumerate() {
+        let blob = classify_blob(*canonical);
+        let slot = blob_base + (index as u64) * 0x400;
+        if !write_bytes_at(handle, slot, &blob) {
+            unsafe { CloseHandle(handle) };
+            return Err("blob write failed".into());
+        }
+        let mut descriptor = vec![0u8; 0x20];
+        descriptor[0x0..0x8].copy_from_slice(&slot.to_le_bytes());
+        descriptor[0x10..0x18].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+        descriptor[0x18..0x20].copy_from_slice(&(blob.len() as u64 + 1).to_le_bytes());
+        if !write_bytes_at(handle, desc_base + (index as u64) * 0x20, &descriptor) {
+            unsafe { CloseHandle(handle) };
+            return Err("descriptor write failed".into());
+        }
+    }
+    if !write_bytes_at(handle, name_slot as u64, b"=zeno\0") {
+        unsafe { CloseHandle(handle) };
+        return Err("name write failed".into());
+    }
+
+    let global = read_u64(handle, state + LUA_U64_GLOBAL);
+    let pcall_value = read_u64(handle, global + G_U64_BUILTIN_PCALL);
+    if pcall_value < 0x10000 {
+        unsafe { CloseHandle(handle) };
+        return Err(format!("builtin pcall is not resolved (0x{pcall_value:X})"));
+    }
+    println!("classify    {} candidates 0x{from:02X}..0x{to:02X}", count);
+
+    let index = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let call_slot = std::rc::Rc::new(std::cell::Cell::new(0u64));
+
+    let mut steps: Vec<Step> = Vec::new();
+    for (position, _) in candidates.iter().enumerate() {
+        let descriptor = desc_base + (position as u64) * 0x20;
+        steps.push(Step {
+            label: "luau_load",
+            rva: LUA_LOAD_RVA,
+            absolute: false,
+            prepare: Box::new(move |_handle| Some([state, descriptor, name_slot as u64, 0])),
+        });
+        let slot_cell = call_slot.clone();
+        steps.push(Step {
+            label: "luaD_call",
+            rva: LUA_D_CALL_RVA,
+            absolute: false,
+            prepare: Box::new(move |handle| {
+                if no_exec_requested() {
+                    return None;
+                }
+                let top = read_u64_checked(handle, state + LUA_U64_TOP)?;
+                if top < 64 {
+                    return None;
+                }
+                let Some(closure) = read_bytes(handle, top - 16, 16) else {
+                    return None;
+                };
+                // `luaD_call(L, funcslot, nresults, 0)` takes the slot holding
+                // the *function*, not the base of an argument list. Getting that
+                // one slot wrong hands the VM a nil and the frame unwinds into
+                // nowhere, so the two layouts below each name their own slot.
+                let call_base = if std::env::var("ZENO_PCALL").is_ok() {
+                    // Push the builtin pcall under the chunk so a raising
+                    // instruction lands in the error text, not the thread.
+                    let slot = top - 32;
+                    if !write_tvalue(handle, slot, pcall_value, LUA_TFUNCTION) {
+                        return None;
+                    }
+                    if !write_bytes_at(handle, slot + 16, &closure) {
+                        return None;
+                    }
+                    if !write_u64_at(handle, state + LUA_U64_TOP, slot + 32) {
+                        return None;
+                    }
+                    slot
+                } else {
+                    // Straight call on the chunk: function at top-16, top past it.
+                    if !write_bytes_at(handle, top - 16, &closure) {
+                        return None;
+                    }
+                    if !write_u64_at(handle, state + LUA_U64_TOP, top) {
+                        return None;
+                    }
+                    top - 16
+                };
+                let slot = call_base;
+                if std::env::var("ZENO_STACK").is_ok() {
+                    let stack = read_u64(handle, state + LUA_U64_STACK);
+                    let last = read_u64(handle, state + LUA_U64_STACK_LAST);
+                    let base = read_u64(handle, state + 0x58);
+                    println!(
+                        "classify   prep top 0x{top:X} slot 0x{slot:X} base 0x{base:X} stack 0x{stack:X} last 0x{last:X}"
+                    );
+                    println!("classify   prep slot[0] {}", describe_tvalue(handle, slot));
+                    println!("classify   prep slot[1] {}", describe_tvalue(handle, slot + 16));
+                }
+                slot_cell.set(slot);
+                Some([state, slot, u64::MAX, 0])
+            }),
+        });
+    }
+
+    let watch_index = index.clone();
+    let watch_slot = call_slot.clone();
+    let watch_candidates = candidates.clone();
+    let outcome = hijack_now_watch(
+        pid,
+        steps,
+        20000,
+        10,
+        prefer,
+        vec![(
+            "luaD_call",
+            Box::new(move |handle| {
+                let current = watch_index.get();
+                let canonical = watch_candidates.get(current).copied().unwrap_or(0xFF);
+                // The state's base and top belong to whichever Lua thread is
+                // live, so read the slots this call actually armed instead:
+                // the chunk returns exactly four values from its function slot.
+                let slot = watch_slot.get();
+                let mut rendered = Vec::new();
+                if slot != 0 {
+                    for index in 0..4u64 {
+                        rendered.push(describe_tvalue(handle, slot + index * 16));
+                    }
+                }
+                println!("classify   0x{canonical:02X} -> {}", rendered.join(" | "));
+                if std::env::var("ZENO_STACK").is_ok() {
+                    let stack = read_u64(handle, state + LUA_U64_STACK);
+                    let last = read_u64(handle, state + LUA_U64_STACK_LAST);
+                    let base = read_u64(handle, state + 0x58);
+                    let top = read_u64(handle, state + LUA_U64_TOP);
+                    println!("classify       stack 0x{stack:X} last 0x{last:X} base 0x{base:X} top 0x{top:X} armed 0x{slot:X}");
+                    let mut cursor = slot.saturating_sub(0x20);
+                    while cursor + 16 <= last && cursor < slot + 0x80 {
+                        println!("classify       [{:03X}] {}", cursor.wrapping_sub(slot), describe_tvalue(handle, cursor));
+                        cursor += 16;
+                    }
+                }
+                watch_index.set(current + 1);
+            }),
+        )],
+    );
+    unsafe { CloseHandle(handle) };
+    outcome.map(|_| ())
+}
+
 fn image_test(
     pid: u32,
     dll: &std::path::Path,
@@ -3973,6 +4226,7 @@ fn main() -> Result<(), String> {
     let mut forced_thread: Option<u32> = None;
     let mut execute: Option<(u64, PathBuf)> = None;
     let mut scan_state: Option<u64> = None;
+    let mut classify_state: Option<(u64, u8, u8)> = None;
     let mut findmap = false;
     let mut opmap_probe: Option<Vec<u8>> = None;
     let mut carrier: Option<String> = None;
@@ -4160,6 +4414,26 @@ fn main() -> Result<(), String> {
                         .map_err(|_| format!("bad address {value}"))?,
                 );
             }
+            "--classify" => {
+                let value = argv.next().ok_or("--classify needs a lua_State address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                classify_state = Some((address, 0x00, 0x3F));
+            }
+            "--from" => {
+                let value = argv.next().ok_or("--from needs a hex byte")?;
+                if let Some((_, from, _)) = classify_state.as_mut() {
+                    *from = u8::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad byte {value}"))?;
+                }
+            }
+            "--to" => {
+                let value = argv.next().ok_or("--to needs a hex byte")?;
+                if let Some((_, _, to)) = classify_state.as_mut() {
+                    *to = u8::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad byte {value}"))?;
+                }
+            }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad address {value}"))?;
@@ -4272,6 +4546,10 @@ fn main() -> Result<(), String> {
         return dump_opcode_table(target, &bytes);
     }
 
+    if let Some((state, from, to)) = classify_state {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return lua_classify(target, state, from, to, forced_thread);
+    }
     if let Some(state) = scan_state {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return lua_scan(target, state, forced_thread);

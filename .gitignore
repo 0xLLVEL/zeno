@@ -17,3 +17,4 @@ tools/zeno-payload/.cargo/target/
 tools/zeno-hyperion/target/
 sample/
 tools/zeno-inject/test/*.bc
+__pycache__/
