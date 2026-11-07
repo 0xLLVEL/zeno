@@ -34,11 +34,6 @@
   "score": 0.633,
   "width": 2
  },
- "CAPTURE": {
-  "byte": 111,
-  "score": 0.65,
-  "width": 1
- },
  "CLOSEUPVALS": {
   "byte": 120,
   "score": 0.611,
@@ -195,8 +190,8 @@
   "width": 1
  },
  "GETVARARGS": {
-  "byte": 193,
-  "score": 0.552,
+  "byte": 221,
+  "score": 0.95,
   "width": 1
  },
  "IDIV": {
@@ -295,8 +290,8 @@
   "width": 1
  },
  "LOADK": {
-  "byte": 221,
-  "score": 0.564,
+  "byte": 111,
+  "score": 0.99,
   "width": 1
  },
  "LOADKX": {
