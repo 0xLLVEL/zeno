@@ -18,3 +18,4 @@ tools/zeno-hyperion/target/
 sample/
 tools/zeno-inject/test/*.bc
 __pycache__/
+tools/zeno-inject/test/*.raw

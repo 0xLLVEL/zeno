@@ -1,0 +1,19 @@
+local acc = 0
+acc = acc + 0
+acc = acc + 1
+acc = acc + 2
+acc = acc + 3
+acc = acc + 4
+acc = acc + 5
+acc = acc + 6
+acc = acc + 7
+acc = acc + 8
+acc = acc + 9
+acc = acc + 10
+acc = acc + 11
+acc = acc + 12
+acc = acc + 13
+acc = acc + 14
+acc = acc + 15
+acc = acc + 16
+return acc

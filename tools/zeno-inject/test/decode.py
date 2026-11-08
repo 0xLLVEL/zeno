@@ -88,8 +88,9 @@ def main(path):
                 consts.append(f"num {struct.unpack_from('<d', data, off)[0]!r}")
                 off += 8
             elif tag == 3:
+                # The serialized index is 1-based into the string table.
                 idx, off = read_varint(data, off)
-                consts.append(f"str[{idx}] " + (repr(strings[idx]) if idx < len(strings) else "?"))
+                consts.append(repr(strings[idx - 1]) if 0 < idx <= len(strings) else f"str?{idx}")
             elif tag == 4:
                 import_id = struct.unpack_from("<i", data, off)[0]
                 off += 4

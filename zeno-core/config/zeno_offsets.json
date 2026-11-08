@@ -55,6 +55,10 @@
     "CastArgs": "0x41cb820",
     "InstanceBridge.Push": "0x42594c0",
     "GetCapabilities": "0x1cea140",
+    "Luau.DefaultCapsObject": "0x8d87878",
+    "Luau.GetCapabilitiesForState": "0x4266aa0",
+    "Luau.CapabilityResolver": "0x4266b00",
+    "Luau.InstanceNewGate": "0x1cf9370",
     "GetFFlag": "0x4b12b50",
     "SetFFlag": "0x4b12050",
     "park_pad": "0x4320d92",
@@ -92,6 +96,7 @@
     "lua_State.finalizers": "0x80",
 
     "global_State.mainthread": "0x78",
+    "global_State.capabilities": "0xa0",
     "global_State.GCthreshold": "0x60",
     "global_State.totalbytes": "0x68",
     "global_State.builtinPcall": "0x5488",

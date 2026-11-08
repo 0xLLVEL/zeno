@@ -20,6 +20,7 @@ static PROTECT: AtomicBool = AtomicBool::new(false);
 /// global table has no `game`, `workspace` or `Instance`; borrowing a live
 /// script closure's environment is how a chunk gets them.
 static ADOPT_ENV: AtomicU64 = AtomicU64::new(0);
+static DUMP_PROTO: AtomicBool = AtomicBool::new(false);
 
 type Handle = *mut c_void;
 
@@ -3024,6 +3025,331 @@ fn gc_walk(pid: u32, global: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Dump a `lua_State` and follow every field that looks like a pointer, so a
+/// per-thread side table (script context, identity, capabilities) can be
+/// spotted by comparing two threads that behave differently.
+fn state_fields(pid: u32, state: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let Some(raw) = read_bytes(handle, state, 0x90) else {
+        unsafe { CloseHandle(handle) };
+        return Err("cannot read lua_State".into());
+    };
+    println!("state       0x{state:X}");
+    for row in 0..9 {
+        let chunk = &raw[row * 16..row * 16 + 16];
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        println!("state       +{:03X}  {}", row * 16, hex.join(" "));
+    }
+    for off in (0..0x90usize).step_by(8) {
+        let value = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        if !(0x10000..0x0000_7FFF_FFFF_FFFF).contains(&value) {
+            continue;
+        }
+        match read_bytes(handle, value, 0x40) {
+            Some(bytes) => {
+                let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+                println!("state       +{off:02X} -> 0x{value:X}  {}", hex.join(" "));
+            }
+            None => println!("state       +{off:02X} -> 0x{value:X}  (unreadable)"),
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Scan committed memory for `lua_State` objects that belong to `global`. Every
+/// thread in the VM carries the same `global_State*` at +0x50, so that pointer
+/// is a unique enough signature to enumerate them without walking a GC list
+/// whose link layout this build does not use.
+fn find_threads(pid: u32, global: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let pattern = global.to_le_bytes();
+    let mut address = 0x10000u64;
+    let mut info = [0u8; 48];
+    let chunk = 1u64 * 1024 * 1024;
+    let mut found: Vec<u64> = Vec::new();
+
+    while address < 0x7FFF_FFFF_0000 {
+        let got = unsafe {
+            VirtualQueryEx(handle, address as *const c_void, info.as_mut_ptr() as *mut c_void, 48)
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+        let next = base.saturating_add(size);
+        let readable = state == 0x1000
+            && protect & 0x100 == 0
+            && matches!(protect & 0xFF, 0x02 | 0x04 | 0x06 | 0x08 | 0x20 | 0x40 | 0x80);
+        if readable && size <= 512 * 1024 * 1024 {
+            let mut cursor = 0u64;
+            while cursor < size {
+                let want = chunk.min(size - cursor);
+                if let Some(window) = read_bytes(handle, base + cursor, want as usize) {
+                    let mut i = 0usize;
+                    while i + 8 <= window.len() {
+                        if window[i..i + 8] == pattern {
+                            let candidate = base + cursor + i as u64;
+                            if candidate >= 0x50 {
+                                found.push(candidate - 0x50);
+                            }
+                        }
+                        i += 8;
+                    }
+                }
+                cursor += want;
+            }
+        }
+        if next <= address {
+            break;
+        }
+        address = next;
+    }
+
+    let mut threads = 0usize;
+    for candidate in &found {
+        let Some(raw) = read_bytes(handle, *candidate, 0x90) else { continue };
+        if raw[1] != 0x0A {
+            continue;
+        }
+        let q = |off: usize| u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        if q(0x50) != global {
+            continue;
+        }
+        let (stack, base_ci, end_ci, top, stack_last, ci) =
+            (q(0x48), q(0x28), q(0x20), q(0x60), q(0x68), q(0x70));
+        if stack < 0x10000 || stack_last < stack || top < stack || top > stack_last {
+            continue;
+        }
+        if base_ci < 0x10000 || end_ci < base_ci || ci < base_ci || ci > end_ci {
+            continue;
+        }
+        threads += 1;
+        println!(
+            "threads     state 0x{candidate:X} stack 0x{stack:X} top 0x{top:X} ci 0x{ci:X} depth {} gt 0x{:X}",
+            (ci - base_ci) / 0x30,
+            q(0x10)
+        );
+    }
+    println!("threads     {} candidate states, {} validated", found.len(), threads);
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Dump a Closure and every pointer it holds, plus the `+0x190`/`+0x93` pair
+/// the capability check reads, so a freshly loaded chunk can be compared with
+/// a closure that belongs to a real script.
+fn closure_probe(pid: u32, closure: u64) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let Some(raw) = read_bytes(handle, closure, 0xA0) else {
+        unsafe { CloseHandle(handle) };
+        return Err("cannot read closure".into());
+    };
+    println!("cprobe      closure 0x{closure:X}");
+    for row in 0..10 {
+        let chunk = &raw[row * 16..row * 16 + 16];
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+        println!("cprobe      +{:03X}  {}", row * 16, hex.join(" "));
+    }
+    println!(
+        "cprobe      isC {} stacksize {} preload {} env 0x{:X}",
+        raw[5], raw[6], raw[7],
+        u64::from_le_bytes(raw[0x10..0x18].try_into().unwrap())
+    );
+    for off in (0x18usize..0xA0).step_by(8) {
+        let p = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        if !(0x10000..0x0000_7FFF_FFFF_FFFF).contains(&p) {
+            continue;
+        }
+        let code = read_u64(handle, p + 0x68);
+        let sizecode = read_i32_at(handle, p + 0xa8).unwrap_or(-1);
+        let sec = read_u64(handle, p + 0x190);
+        let idb = read_u8_at(handle, p + 0x93).unwrap_or(0xff);
+        let p18 = read_u64(handle, p + 0x18);
+        println!(
+            "cprobe      +{off:02X} -> 0x{p:X} code 0x{code:X} sizecode {sizecode} sec+190 0x{sec:X} byte+93 0x{idb:02X} +18 0x{p18:X}"
+        );
+        if code > 0x10000 && (0..=100000).contains(&sizecode) {
+            let cap_raw = read_u64(handle, p + 0x80);
+            let cap_self = p + 0x80;
+            let cap_ptr = if cap_raw == cap_self { 0 } else { cap_raw ^ cap_self };
+            let cap_mask = if cap_ptr != 0 { read_u64(handle, cap_ptr) } else { 0 };
+            println!(
+                "cprobe        proto+80 raw 0x{cap_raw:X} self 0x{cap_self:X} ptr 0x{cap_ptr:X} mask 0x{cap_mask:X}"
+            );
+            if let Some(head) = read_bytes(handle, p, 0x40) {
+                let hex: Vec<String> = head.iter().map(|b| format!("{b:02X}")).collect();
+                println!("cprobe        proto head {}", hex.join(" "));
+            }
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Hunt for the security-context shape the capability check reads:
+/// a qword at `+0x190` whose low byte is an identity (0..8) and whose upper
+/// bits are a capability mask, on an object that also has a pointer at `+0x18`
+/// and a small byte at `+0x93`.
+fn cap_scan(pid: u32, base: u64, len: usize) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let chunk = 1usize * 1024 * 1024;
+    let mut offset = 0usize;
+    let mut hits = 0usize;
+    while offset < len {
+        let want = chunk.min(len - offset);
+        let Some(window) = read_bytes(handle, base + offset as u64, want) else {
+            offset += want;
+            continue;
+        };
+        let mut i = 0usize;
+        while i + 8 <= window.len() {
+            let q = u64::from_le_bytes(window[i..i + 8].try_into().unwrap());
+            i += 8;
+            if q == 0 || (q & 0xFF) > 8 || (q >> 8) == 0 {
+                continue;
+            }
+            let here = base + offset as u64 + (i as u64 - 8);
+            if here < 0x190 {
+                continue;
+            }
+            let object = here - 0x190;
+            let Some(head) = read_bytes(handle, object, 0xA0) else { continue };
+            let ptr18 = u64::from_le_bytes(head[0x18..0x20].try_into().unwrap());
+            if !(0x10000..0x0000_7FFF_FFFF_FFFF).contains(&ptr18) {
+                continue;
+            }
+            let idb = head[0x93];
+            if idb > 8 {
+                continue;
+            }
+            let name = read_u64(handle, ptr18 + 8);
+            let sec = read_u64(handle, ptr18 + 0x190);
+            println!(
+                "capscan     0x{object:X} caps 0x{q:X} id {idb} +18 0x{ptr18:X} sec+8 0x{name:X} sec+190 0x{sec:X}"
+            );
+            hits += 1;
+            if hits > 60 {
+                println!("capscan     (stopping at 60 hits)");
+                unsafe { CloseHandle(handle) };
+                return Ok(());
+            }
+        }
+        offset += want;
+    }
+    println!("capscan     {hits} hits over 0x{len:X} bytes");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+/// Sweeps committed private memory for the security object `0x1cf7250` reads
+/// through `[owner+0x18]`: a qword at `+0x190` holding identity | capability
+/// mask, a `std::string` at `+0x08` naming the scope, and small counters at
+/// `+0x1B8`/`+0x1BA`.
+fn heap_scan(pid: u32, _module_base: u64, _module_size: u64, limit: usize) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let mut address = 0x10000u64;
+    let mut info = [0u8; 48];
+    let chunk = 1u64 * 1024 * 1024;
+    let mut hits = 0usize;
+    let mut scanned = 0u64;
+    let mut regions = 0usize;
+
+    while address < 0x7FFF_FFFF_0000 {
+        let got = unsafe {
+            VirtualQueryEx(handle, address as *const c_void, info.as_mut_ptr() as *mut c_void, 48)
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+        let next = base.saturating_add(size);
+        let readable = state == 0x1000
+            && protect & 0x100 == 0
+            && matches!(protect & 0xFF, 0x02 | 0x04 | 0x06 | 0x08 | 0x20 | 0x40 | 0x80);
+        if readable && size <= 512 * 1024 * 1024 {
+            regions += 1;
+            let mut cursor = 0u64;
+            while cursor < size {
+                let want = chunk.min(size - cursor);
+                if let Some(window) = read_bytes(handle, base + cursor, want as usize) {
+                    scanned += want;
+                    let mut i = 0usize;
+                    while i + 8 <= window.len() {
+                        let q = u64::from_le_bytes(window[i..i + 8].try_into().unwrap());
+                        let here = base + cursor + i as u64;
+                        i += 8;
+                        let idb = q & 0xFF;
+                        if idb == 0 || idb > 8 || (q >> 8) == 0 || here < 0x190 {
+                            continue;
+                        }
+                        let sec = here - 0x190;
+                        let Some(name) = read_u64_checked(handle, sec + 8) else { continue };
+                        if !(0x10000..0x0000_7FFF_FFFF_FFFF).contains(&name) {
+                            continue;
+                        }
+                        let len = read_u64(handle, name + 0x18);
+                        if len == 0 || len > 64 {
+                            continue;
+                        }
+                        let data_at = if len >= 0x10 { read_u64(handle, name) } else { name };
+                        let Some(bytes) = read_bytes(handle, data_at, len as usize) else { continue };
+                        if !bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+                            continue;
+                        }
+                        let depth = read_u16_at(handle, sec + 0x1B8).unwrap_or(0xFFFF);
+                        if depth > 0x800 {
+                            continue;
+                        }
+                        println!(
+                            "hscan       0x{sec:X} id {idb} caps 0x{q:X} name {:?} depth 0x{depth:X}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        hits += 1;
+                        if hits >= limit {
+                            println!("hscan       stopping at {limit} hits");
+                            unsafe { CloseHandle(handle) };
+                            return Ok(());
+                        }
+                    }
+                }
+                cursor += want;
+            }
+        }
+        address = next;
+    }
+    println!("hscan       {hits} hits, {regions} regions, 0x{scanned:X} bytes scanned");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 fn vm_info(pid: u32, state: u64) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
@@ -3780,6 +4106,35 @@ const LUA_RAWPROT_RVA: u64 = 0x26360B0;
 const LUA_F_CALL_RVA: u64 = 0x2632230;
 const LUA_COMPILE_RVA: u64 = 0x426A1F0;
 
+/// The default capability object `luau_load` attaches to every freshly compiled
+/// chunk: `proto+0x80` points at it (xor-obfuscated self-pointer), and the
+/// resolver at `0x4266AA0` intersects `[G+0xA0]` with the qword it holds.
+/// The client ships the object zeroed, so injected chunks resolve to a mask of
+/// zero and every mutating call is refused. It lives in module `.data`, not
+/// `.text`, so writing it does not trip the integrity checks.
+const DEFAULT_CAPS_RVA: u64 = 0x8D87878;
+const CAPS_ALL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Raise the default chunk capability mask to all-ones. Returns the value that
+/// was there before the write.
+fn unlock_caps(handle: Handle, pid: u32) -> Result<u64, String> {
+    let module = modules_of(pid)
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(EXE))
+        .ok_or_else(|| format!("{EXE} module not found"))?;
+    let address = module.base + DEFAULT_CAPS_RVA;
+    let before = read_u64(handle, address);
+    if before == CAPS_ALL {
+        println!("caps        already 0x{CAPS_ALL:X} at 0x{address:X}");
+        return Ok(before);
+    }
+    if !write_u64_at(handle, address, CAPS_ALL) {
+        return Err(format!("caps write at 0x{address:X} failed"));
+    }
+    println!("caps        0x{address:X} 0x{before:X} -> 0x{CAPS_ALL:X} (written)");
+    Ok(before)
+}
+
 /// Loads a script with the client's own `luau_load` and runs it through the
 /// client's own `pcall` closure, so a script error unwinds through Roblox's
 /// handler instead of escaping into the hijacked thread.
@@ -3788,6 +4143,9 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    if let Err(e) = unlock_caps(handle, pid) {
+        println!("exec        {e}");
     }
 
     // LuaVMLoad(L, const std::string* source, const char* chunkname, int env)
@@ -3910,6 +4268,10 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                 println!("exec        compile error: {}", read_tstring(handle, value));
                 return None;
             }
+            if tag == 6 {
+                println!("exec        load error: {}", read_tstring(handle, value));
+                return None;
+            }
             if tag != LUA_TFUNCTION {
                 return None;
             }
@@ -4004,6 +4366,16 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                             "exec        proto via +{off:02X} 0x{candidate:X} sizecode {sizecode} code 0x{code:X} [{}]",
                             hex.join(" ")
                         );
+                        if DUMP_PROTO.load(Ordering::Relaxed) {
+                            if let Some(body) = read_bytes(handle, candidate, 0x1B0) {
+                                for row in 0..0x1B {
+                                    let chunk = &body[row * 16..row * 16 + 16];
+                                    let hex: Vec<String> =
+                                        chunk.iter().map(|b| format!("{b:02X}")).collect();
+                                    println!("pdump       +{:03X}  {}", row * 16, hex.join(" "));
+                                }
+                            }
+                        }
                         let k = read_u64(handle, candidate + 0x60);
                         if k >= 0x10000 {
                             let mut line = String::new();
@@ -4929,6 +5301,13 @@ fn main() -> Result<(), String> {
     let mut raw_bytes: Option<(u64, usize)> = None;
     let mut vminfo: Option<u64> = None;
     let mut lfind: Option<u64> = None;
+    let mut state_dump: Option<u64> = None;
+    let mut thread_scan: Option<u64> = None;
+    let mut closure_probe_at: Option<u64> = None;
+    let mut qword_write: Option<(u64, u64)> = None;
+    let mut cap_scan_at: Option<(u64, usize)> = None;
+    let mut caps_request = false;
+    let mut heap_scan_limit: Option<usize> = None;
     let mut scan_live = false;
     let mut gcwalk: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
@@ -5043,6 +5422,27 @@ fn main() -> Result<(), String> {
             "--lfind" => {
                 let value = argv.next().ok_or("--lfind needs a lua_State address")?;
                 lfind = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--state" => {
+                let value = argv.next().ok_or("--state needs a lua_State address")?;
+                state_dump = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--cprobe" => {
+                let value = argv.next().ok_or("--cprobe needs a Closure address")?;
+                closure_probe_at = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
+            "--threads" => {
+                let value = argv.next().ok_or("--threads needs a global_State address")?;
+                thread_scan = Some(
                     u64::from_str_radix(value.trim_start_matches("0x"), 16)
                         .map_err(|_| format!("bad address {value}"))?,
                 );
@@ -5184,6 +5584,34 @@ fn main() -> Result<(), String> {
                     .map_err(|_| format!("bad address {value}"))?;
                 ADOPT_ENV.store(table, Ordering::Relaxed);
             }
+            "--pdump" => {
+                DUMP_PROTO.store(true, Ordering::Relaxed);
+            }
+            "--capscan" => {
+                let value = argv.next().ok_or("--capscan needs a base address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let text = argv.next().ok_or("--capscan needs a length")?;
+                let length = usize::from_str_radix(text.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad length {text}"))?;
+                cap_scan_at = Some((address, length));
+            }
+            "--hscan" => {
+                let text = argv.next().unwrap_or_else(|| "40".to_string());
+                let limit = text.parse::<usize>().map_err(|_| format!("bad limit {text}"))?;
+                heap_scan_limit = Some(limit);
+            }
+            "--wq" => {                let value = argv.next().ok_or("--wq needs an address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let text = argv.next().ok_or("--wq needs a 64-bit value")?;
+                let payload = u64::from_str_radix(text.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad value {text}"))?;
+                qword_write = Some((address, payload));
+            }
+            "--caps" => {
+                caps_request = true;
+            }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad address {value}"))?;
@@ -5255,6 +5683,61 @@ fn main() -> Result<(), String> {
         return find_lclosure(target, state);
     }
 
+    if let Some(state) = state_dump {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return state_fields(target, state);
+    }
+
+    if let Some(closure) = closure_probe_at {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return closure_probe(target, closure);
+    }
+
+    if let Some(limit) = heap_scan_limit {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let modules = modules_of(target);
+        let module = modules
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(EXE))
+            .ok_or_else(|| format!("{EXE} module not found"))?;
+        return heap_scan(target, module.base, module.size, limit);
+    }
+
+    if let Some((address, length)) = cap_scan_at {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return cap_scan(target, address, length);
+    }
+
+    if let Some((address, payload)) = qword_write {        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, target) };
+        if handle.is_null() || handle == -1isize as Handle {
+            return Err(format!("OpenProcess({target}) failed ({})", unsafe { GetLastError() }));
+        }
+        let before = read_u64(handle, address);
+        let mut written = 0usize;
+        let ok = unsafe {
+            WriteProcessMemory(
+                handle,
+                address as *mut c_void,
+                &payload as *const u64 as *const c_void,
+                8,
+                &mut written,
+            )
+        };
+        let after = read_u64(handle, address);
+        println!(
+            "wq          0x{address:X} 0x{before:X} -> 0x{after:X} ({})",
+            if ok != 0 { "written" } else { "FAILED" }
+        );
+        unsafe { CloseHandle(handle) };
+        return Ok(());
+    }
+
+    if let Some(global) = thread_scan {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_threads(target, global);
+    }
+
     if let Some(state) = vminfo {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return vm_info(target, state);
@@ -5323,6 +5806,17 @@ fn main() -> Result<(), String> {
     if let Some(state) = scan_state {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return lua_scan(target, state, forced_thread);
+    }
+
+    if caps_request {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, target) };
+        if handle.is_null() || handle == -1isize as Handle {
+            return Err(format!("OpenProcess({target}) failed ({})", unsafe { GetLastError() }));
+        }
+        let result = unlock_caps(handle, target);
+        unsafe { CloseHandle(handle) };
+        return result.map(|_| ());
     }
 
     if let Some((state, script)) = execute {
