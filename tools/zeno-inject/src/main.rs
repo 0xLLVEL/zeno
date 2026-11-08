@@ -4353,8 +4353,62 @@ fn lua_sizesweep(
 /// Loads a script with the client's own `luau_load` and runs it through the
 /// client's own `pcall` closure, so a script error unwinds through Roblox's
 /// handler instead of escaping into the hijacked thread.
-fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>) -> Result<(), String> {
+/// Stages one chunk for `LuaVMLoad`: an MSVC `std::string` descriptor plus the
+/// payload and the chunk name. Returns `(string_slot, buffer_slot, name_slot)`.
+///
+/// `LuaVMLoad(L, const std::string* source, const char* chunkname, int env)`
+/// takes `rdx` as a `std::string`: buffer pointer at +0x0, size at +0x10,
+/// capacity at +0x18, inline buffer 16 bytes when capacity is 15. Capacity is
+/// forced above 15 so the client reads through `[obj+0]`, which is the branch
+/// it takes for anything longer than SSO.
+fn stage_chunk(handle: Handle, body: &[u8], name: &[u8]) -> Option<(u64, u64, u64)> {
+    let size = body.len();
+    let capacity = size.max(15) + 1;
+    let string_slot =
+        unsafe { VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
+    let buffer_slot = unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            size + 1,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    let name_slot =
+        unsafe { VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE) };
+    if string_slot.is_null() || buffer_slot.is_null() || name_slot.is_null() {
+        return None;
+    }
+    let mut descriptor = vec![0u8; 0x20];
+    descriptor[0x0..0x8].copy_from_slice(&(buffer_slot as u64).to_le_bytes());
+    descriptor[0x10..0x18].copy_from_slice(&(size as u64).to_le_bytes());
+    descriptor[0x18..0x20].copy_from_slice(&(capacity as u64).to_le_bytes());
+    let ok = write_bytes_at(handle, string_slot as u64, &descriptor)
+        && write_bytes_at(handle, buffer_slot as u64, body)
+        && write_bytes_at(handle, name_slot as u64, name);
+    if !ok {
+        return None;
+    }
+    println!(
+        "exec        staged string 0x{:X} -> buffer 0x{:X} ({size} bytes, cap {capacity}) name 0x{:X}",
+        string_slot as u64, buffer_slot as u64, name_slot as u64
+    );
+    Some((string_slot as u64, buffer_slot as u64, name_slot as u64))
+}
+
+fn lua_exec(
+    pid: u32,
+    state: u64,
+    script: &std::path::Path,
+    wrapper: Option<&std::path::Path>,
+    prefer: Option<u32>,
+) -> Result<(), String> {
     let source = std::fs::read(script).map_err(|e| format!("{}: {e}", script.display()))?;
+    let wrapper_source = match wrapper {
+        Some(path) => Some(std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?),
+        None => None,
+    };
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
@@ -4363,51 +4417,22 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
         println!("exec        {e}");
     }
 
-    // LuaVMLoad(L, const std::string* source, const char* chunkname, int env)
-    //   rdx is an MSVC std::string: buffer pointer at +0x0, size at +0x10,
-    //   capacity at +0x18, inline buffer 16 bytes when capacity is 15.
-    //   Capacity is forced above 15 so the client reads through `[obj+0]`,
-    //   which is the branch it takes for anything longer than SSO.
-    let source_size = source.len();
-    let source_capacity = source_size.max(15) + 1;
-    let chunkname = b"=zeno\0";
-
-    let string_slot = unsafe {
-        VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE)
-    };
-    let buffer_slot = unsafe {
-        VirtualAllocEx(
-            handle,
-            std::ptr::null_mut(),
-            source_size + 1,
-            MEM_COMMIT_RESERVE,
-            PAGE_READWRITE,
-        )
-    };
-    let name_slot = unsafe {
-        VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE)
-    };
-    if string_slot.is_null() || buffer_slot.is_null() || name_slot.is_null() {
+    let Some((target_string, _target_buffer, target_name)) =
+        stage_chunk(handle, &source, b"=zeno\0")
+    else {
         unsafe { CloseHandle(handle) };
         return Err("argument allocation failed".into());
-    }
-
-    let mut descriptor = vec![0u8; 0x20];
-    descriptor[0x0..0x8].copy_from_slice(&(buffer_slot as u64).to_le_bytes());
-    descriptor[0x10..0x18].copy_from_slice(&(source_size as u64).to_le_bytes());
-    descriptor[0x18..0x20].copy_from_slice(&(source_capacity as u64).to_le_bytes());
-
-    let string_ok = write_bytes_at(handle, string_slot as u64, &descriptor);
-    let buffer_ok = write_bytes_at(handle, buffer_slot as u64, &source);
-    let name_ok = write_bytes_at(handle, name_slot as u64, chunkname);
-    if !string_ok || !buffer_ok || !name_ok {
-        unsafe { CloseHandle(handle) };
-        return Err("argument write failed".into());
-    }
-    println!(
-        "exec        staged string 0x{:X} -> buffer 0x{:X} ({source_size} bytes, cap {source_capacity}) name 0x{:X}",
-        string_slot as u64, buffer_slot as u64, name_slot as u64
-    );
+    };
+    let wrapper_stage = match &wrapper_source {
+        Some(body) => match stage_chunk(handle, body, b"=wrap\0") {
+            Some(stage) => Some(stage),
+            None => {
+                unsafe { CloseHandle(handle) };
+                return Err("wrapper allocation failed".into());
+            }
+        },
+        None => None,
+    };
     if let Some(client) = modules_of(pid).iter().find(|m| m.name.eq_ignore_ascii_case(EXE)) {
         println!(
             "exec        loader compile-flag byte {}",
@@ -4438,17 +4463,31 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
             prepare: Box::new(|_handle| Some([1, 0, 0, 0])),
         });
     }
+    if let Some((string_slot, _buffer, name_slot)) = wrapper_stage {
+        let size = wrapper_source.as_ref().map(|b| b.len()).unwrap_or(0);
+        steps.push(Step {
+            label: "luau_load",
+            rva: LUA_LOAD_RVA,
+            absolute: false,
+            prepare: Box::new(move |_handle| {
+                println!("exec        loading wrapper {size} bytes at 0x{string_slot:X}");
+                Some([state, string_slot, name_slot, 0])
+            }),
+        });
+    }
+    let target_size = source.len();
     steps.push(Step {
         label: "luau_load",
         rva: LUA_LOAD_RVA,
         absolute: false,
         prepare: Box::new(move |_handle| {
-            println!("exec        loading {source_size} bytes at 0x{:X}", string_slot as u64);
-            Some([state, string_slot as u64, name_slot as u64, 0])
+            println!("exec        loading {target_size} bytes at 0x{target_string:X}");
+            Some([state, target_string, target_name, 0])
         }),
     });
     let call_slot = slot.clone();
     let result_slot = slot.clone();
+    let wrapped = wrapper_stage.is_some();
     // A direct `luaD_call` runs the chunk unprotected: one raising opcode
     // unwinds through whatever `errorJmp` the hijacked thread happens to
     // carry and takes the client with it. `lua_pcall` wraps the same call in
@@ -4467,11 +4506,15 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                 return None;
             }
             let top = read_u64_checked(handle, state + LUA_U64_TOP)?;
-            if top < 32 {
+            if top < 64 {
                 println!("exec        top 0x{top:X} is implausible");
                 return None;
             }
-            let function_slot = top - 16;
+            // With a wrapper the stack reads `[wrapper][target]`: the target
+            // closure sits on top and is handed to the wrapper as its single
+            // argument, so `top` must stay exactly where the loader left it.
+            let target_slot = top - 16;
+            let function_slot = if wrapped { target_slot - 16 } else { target_slot };
             let value = read_u64(handle, function_slot);
             let tag = read_i32_at(handle, function_slot + TVAL_I32_TT).unwrap_or(-1);
             let global = read_u64(handle, state + LUA_U64_GLOBAL);
@@ -4514,7 +4557,8 @@ fn lua_exec(pid: u32, state: u64, script: &std::path::Path, prefer: Option<u32>)
                     let _ = write_u64_at(handle, proto + 0x10, 0);
                 }
             }
-            if !write_u64_at(handle, state + LUA_U64_TOP, function_slot + 16) {
+            let new_top = if wrapped { top } else { function_slot + 16 };
+            if !write_u64_at(handle, state + LUA_U64_TOP, new_top) {
                 return None;
             }
             call_slot.set(function_slot);
@@ -5674,6 +5718,7 @@ fn main() -> Result<(), String> {
     let mut hijack_now_opts: Option<(u64, [u64; 4], u64)> = None;
     let mut forced_thread: Option<u32> = None;
     let mut execute: Option<(u64, PathBuf)> = None;
+    let mut wrap_script: Option<PathBuf> = None;
     let mut sweep: Vec<(u64, PathBuf)> = Vec::new();
     let mut scan_state: Option<u64> = None;
     let mut classify_state: Option<(u64, u8, u8)> = None;
@@ -5989,6 +6034,9 @@ fn main() -> Result<(), String> {
                 let script = PathBuf::from(argv.next().ok_or("--sweep needs a script path")?);
                 sweep.push((state, script));
             }
+            "--wrap" => {
+                wrap_script = Some(PathBuf::from(argv.next().ok_or("--wrap needs a path")?));
+            }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad address {value}"))?;
@@ -6224,7 +6272,7 @@ fn main() -> Result<(), String> {
 
     if let Some((state, script)) = execute {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
-        return lua_exec(target, state, &script, forced_thread);
+        return lua_exec(target, state, &script, wrap_script.as_deref(), forced_thread);
     }
 
     if let Some((address, length)) = raw_bytes {
