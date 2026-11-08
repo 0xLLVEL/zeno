@@ -5501,9 +5501,13 @@ const BYTECODE_GUARD_RVA: u64 = 0x43178A0;
 ///
 /// It ships as `0x200`, so a chunk has to be at least `0x218` bytes before the
 /// gate ever looks at the tail tag. Raising it to `INT_MAX` makes every chunk
-/// take the same early-out the 279-byte ones do, which is what lets a chunk
-/// larger than 535 bytes through at all. The cell is in module `.data`; only
-/// `.text` writes trip Hyperion.
+/// take the same early-out the 279-byte ones do — but only up to the hard cap
+/// the gate applies two instructions later, where `mov eax, 0x400` overrides
+/// the loaded floor and the comparison becomes `size - 0x18 < 0x400`. Measured
+/// live: 1047-byte bytecode loads, 1048 rejects. Past that the gate falls into
+/// its whitelist branch and compares the tag against a read-only table at rva
+/// 0x680F04C, which cannot be written without flipping page protection.
+/// The cell is in module `.data`; only `.text` writes trip Hyperion.
 const GUARD_FLOOR_RVA: u64 = 0x8195F48;
 const GUARD_FLOOR_STOCK: u32 = 0x200;
 const GUARD_FLOOR_OPEN: u32 = 0x7FFF_FFFF;
