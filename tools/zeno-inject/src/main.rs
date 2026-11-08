@@ -3434,8 +3434,97 @@ fn find_global(pid: u32, limit: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn vm_info(pid: u32, state: u64) -> Result<(), String> {
+/// Walks one level of pointers out of a lua_State and its global_State, then
+/// reports every reachable object whose first qword points into a loaded module
+/// (i.e. it carries a vtable). That is the shape of the per-thread sandbox
+/// context that `hasCapability` reads at +0x93 and [+0x18]+0x190.
+fn find_ctx(pid: u32, state: u64) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let modules = modules_of(pid);
+    let spans: Vec<(u64, u64)> = modules
+        .iter()
+        .map(|m| (m.base, m.base.saturating_add(m.size)))
+        .collect();
+    let in_module = |v: u64| spans.iter().any(|(a, b)| v >= *a && v < *b);
+    let plausible = |v: u64| v > 0x1_0000 && v < 0x7FFF_FFFF_FFFF;
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut ring1: Vec<u64> = Vec::new();
+    let mut regions: Vec<(u64, Vec<u8>)> = Vec::new();
+    if let Some(bytes) = read_bytes(handle, state, 0x90) {
+        regions.push((state, bytes));
+    }
+    if let Some(bytes) = read_bytes(handle, state + 0x90, 0x600) {
+        regions.push((state + 0x90, bytes));
+    }
+    for (base, bytes) in &regions {
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            if plausible(value) && seen.insert(value) {
+                ring1.push(value);
+            }
+            offset += 8;
+        }
+        let _ = base;
+    }
+
+    let mut ring2: Vec<u64> = Vec::new();
+    for &pointer in &ring1 {
+        let Some(bytes) = read_bytes(handle, pointer, 0x100) else {
+            continue;
+        };
+        let mut offset = 0usize;
+        while offset + 8 <= bytes.len() {
+            let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            if plausible(value) && seen.insert(value) {
+                ring2.push(value);
+            }
+            offset += 8;
+        }
+    }
+
+    println!(
+        "findctx     state 0x{state:X} ring1 {} ring2 {}",
+        ring1.len(),
+        ring2.len()
+    );
+
+    let mut hits = 0usize;
+    for &candidate in ring1.iter().chain(ring2.iter()) {
+        let Some(header) = read_bytes(handle, candidate, 0xA0) else {
+            continue;
+        };
+        let vtable = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        if !in_module(vtable) {
+            continue;
+        }
+        let inner = u64::from_le_bytes(header[0x18..0x20].try_into().unwrap());
+        let caps_byte = header[0x93];
+        let caps_word = if plausible(inner) {
+            read_u64_checked(handle, inner + 0x190)
+        } else {
+            None
+        };
+        let extra_byte = header[0x94];
+        println!(
+            "ctx?        0x{candidate:X} vt 0x{vtable:X} inner 0x{inner:X} b93 0x{caps_byte:02X} b94 0x{extra_byte:02X} caps190 {}",
+            match caps_word {
+                Some(word) => format!("0x{word:X}"),
+                None => "unreadable".to_string(),
+            }
+        );
+        hits += 1;
+    }
+    println!("findctx     {hits} candidates");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
+fn vm_info(pid: u32, state: u64) -> Result<(), String> {    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
         return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
     }
@@ -3512,7 +3601,7 @@ fn describe_tvalue(handle: Handle, slot: u64) -> String {
         5 | 6 if value < 0x10000 => format!("string (null) tag {tag}"),
         5 | 6 => {
             let len = read_u32_at(handle, value + 0x14).unwrap_or(u32::MAX);
-            match read_bytes(handle, value + 0x18, (len as usize).min(64)) {
+            match read_bytes(handle, value + 0x18, (len as usize).min(512)) {
                 Some(bytes) => format!("string tag {tag} len {len} {:?}", String::from_utf8_lossy(&bytes)),
                 None => format!("string tag {tag} 0x{value:X} (unreadable)"),
             }
@@ -5705,6 +5794,8 @@ fn main() -> Result<(), String> {
     let mut thread_scan: Option<u64> = None;
     let mut closure_probe_at: Option<u64> = None;
     let mut qword_write: Option<(u64, u64)> = None;
+    let mut byte_write: Option<(u64, u8)> = None;
+    let mut find_ctx_at: Option<u64> = None;
     let mut cap_scan_at: Option<(u64, usize)> = None;
     let mut caps_request = false;
     let mut guard_probe: Option<PathBuf> = None;
@@ -6018,6 +6109,22 @@ fn main() -> Result<(), String> {
                     .map_err(|_| format!("bad value {text}"))?;
                 qword_write = Some((address, payload));
             }
+            "--wb" => {
+                let value = argv.next().ok_or("--wb needs an address")?;
+                let address = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let text = argv.next().ok_or("--wb needs a byte value")?;
+                let payload = u8::from_str_radix(text.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad value {text}"))?;
+                byte_write = Some((address, payload));
+            }
+            "--findctx" => {
+                let value = argv.next().ok_or("--findctx needs a lua_State address")?;
+                find_ctx_at = Some(
+                    u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad address {value}"))?,
+                );
+            }
             "--caps" => {
                 caps_request = true;
             }
@@ -6146,6 +6253,28 @@ fn main() -> Result<(), String> {
     if let Some(script) = guard_probe {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         return bytecode_guard_probe(target, &script, forced_thread);
+    }
+
+    if let Some((address, payload)) = byte_write {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, target) };
+        if handle.is_null() || handle == -1isize as Handle {
+            return Err(format!("OpenProcess({target}) failed ({})", unsafe { GetLastError() }));
+        }
+        let before = read_bytes(handle, address, 1).map(|b| b[0]).unwrap_or(0);
+        let ok = write_bytes_at(handle, address, &[payload]);
+        let after = read_bytes(handle, address, 1).map(|b| b[0]).unwrap_or(0);
+        println!(
+            "wb          0x{address:X} 0x{before:02X} -> 0x{after:02X} ({})",
+            if ok { "written" } else { "FAILED" }
+        );
+        unsafe { CloseHandle(handle) };
+        return Ok(());
+    }
+
+    if let Some(state) = find_ctx_at {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_ctx(target, state);
     }
 
     if let Some((address, payload)) = qword_write {

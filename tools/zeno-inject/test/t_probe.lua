@@ -1,1 +1,1 @@
-return type(pcall), type(Instance), type(Instance.new), type(workspace.GetChildren)
+return tostring(workspace) .. "|" .. tostring(game) .. "|" .. tostring(#workspace:GetChildren())
