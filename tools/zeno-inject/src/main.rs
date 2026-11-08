@@ -4135,6 +4135,137 @@ fn unlock_caps(handle: Handle, pid: u32) -> Result<u64, String> {
     Ok(before)
 }
 
+/// Runs several `luau_load` calls inside a single hijack.
+///
+/// Every hijack is a chance to lose the session: the thread has to sit still
+/// long enough to be frozen, and a miss takes the whole client down with it.
+/// Bisecting a payload-size wall one blob per process burns one of those
+/// chances per data point. This stages every blob up front and pushes one
+/// `luau_load` step per blob, so a whole bracket costs one hijack.
+///
+/// `L->top` is restored to its pre-hijack value before each load. A load that
+/// succeeds pushes a closure, a load that fails pushes the error string; both
+/// are popped the same way, and the TValue sitting at the baseline after the
+/// step is what says which happened.
+fn lua_sizesweep(
+    pid: u32,
+    state: u64,
+    scripts: &[std::path::PathBuf],
+    prefer: Option<u32>,
+) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    if let Err(e) = unlock_caps(handle, pid) {
+        println!("sweep       {e}");
+    }
+
+    let baseline = read_u64(handle, state + LUA_U64_TOP);
+    println!("sweep       state 0x{state:X} baseline top 0x{baseline:X}");
+    let chunkname = b"=zeno\0";
+    let name_slot = unsafe {
+        VirtualAllocEx(handle, std::ptr::null_mut(), 0x20, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+    };
+    if name_slot.is_null() || !write_bytes_at(handle, name_slot as u64, chunkname) {
+        unsafe { CloseHandle(handle) };
+        return Err("chunkname allocation failed".into());
+    }
+
+    let results: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut steps: Vec<Step> = Vec::new();
+    let mut watch: Vec<(&'static str, Box<dyn Fn(Handle)>)> = Vec::new();
+
+    for script in scripts.iter() {
+        let blob = std::fs::read(script).map_err(|e| format!("{}: {e}", script.display()))?;
+        let size = blob.len();
+        let capacity = size.max(15) + 1;
+        let string_slot = unsafe {
+            VirtualAllocEx(handle, std::ptr::null_mut(), 0x40, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+        };
+        let buffer_slot = unsafe {
+            VirtualAllocEx(
+                handle,
+                std::ptr::null_mut(),
+                size + 1,
+                MEM_COMMIT_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if string_slot.is_null() || buffer_slot.is_null() {
+            unsafe { CloseHandle(handle) };
+            return Err("argument allocation failed".into());
+        }
+        let mut descriptor = vec![0u8; 0x20];
+        descriptor[0x0..0x8].copy_from_slice(&(buffer_slot as u64).to_le_bytes());
+        descriptor[0x10..0x18].copy_from_slice(&(size as u64).to_le_bytes());
+        descriptor[0x18..0x20].copy_from_slice(&(capacity as u64).to_le_bytes());
+        if !write_bytes_at(handle, string_slot as u64, &descriptor)
+            || !write_bytes_at(handle, buffer_slot as u64, &blob)
+        {
+            unsafe { CloseHandle(handle) };
+            return Err("argument write failed".into());
+        }
+
+        let label: &'static str = Box::leak(format!("load{size}").into_boxed_str());
+        let name = script
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        steps.push(Step {
+            label,
+            rva: LUA_LOAD_RVA,
+            absolute: false,
+            prepare: Box::new(move |handle| {
+                write_u64_at(handle, state + LUA_U64_TOP, baseline);
+                Some([state, string_slot as u64, name_slot as u64, 0])
+            }),
+        });
+
+        let log = results.clone();
+        watch.push((
+            label,
+            Box::new(move |handle| {
+                let top = read_u64(handle, state + LUA_U64_TOP);
+                if top != baseline + 16 {
+                    let line = format!("{name:<16} {size:>5} B  no value pushed (top 0x{top:X})");
+                    println!("sweep       {line}");
+                    log.borrow_mut().push(line);
+                    return;
+                }
+                let tag = read_i32_at(handle, baseline + TVAL_I32_TT).unwrap_or(-1);
+                let value = read_u64(handle, baseline);
+                let line = match tag {
+                    LUA_TFUNCTION => format!("{name:<16} {size:>5} B  OK"),
+                    6 => format!(
+                        "{name:<16} {size:>5} B  REJECT  {}",
+                        read_tstring(handle, value)
+                    ),
+                    4 => format!(
+                        "{name:<16} {size:>5} B  COMPILE {}",
+                        read_tstring(handle, value)
+                    ),
+                    other => format!("{name:<16} {size:>5} B  tag {other} value 0x{value:X}"),
+                };
+                println!("sweep       {line}");
+                log.borrow_mut().push(line);
+            }),
+        ));
+    }
+
+    let outcome = hijack_now_watch(pid, steps, 20000, 10, prefer, watch);
+    unsafe { CloseHandle(handle) };
+    let outcome = outcome?;
+
+    println!("sweep       done, thread exit {} ", module_hit(&modules_of(pid), outcome));
+    println!("sweep       ---- results ----");
+    for line in results.borrow().iter() {
+        println!("sweep       {line}");
+    }
+    Ok(())
+}
+
 /// Loads a script with the client's own `luau_load` and runs it through the
 /// client's own `pcall` closure, so a script error unwinds through Roblox's
 /// handler instead of escaping into the hijacked thread.
@@ -5315,6 +5446,7 @@ fn main() -> Result<(), String> {
     let mut hijack_now_opts: Option<(u64, [u64; 4], u64)> = None;
     let mut forced_thread: Option<u32> = None;
     let mut execute: Option<(u64, PathBuf)> = None;
+    let mut sweep: Vec<(u64, PathBuf)> = Vec::new();
     let mut scan_state: Option<u64> = None;
     let mut classify_state: Option<(u64, u8, u8)> = None;
     let mut findmap = false;
@@ -5612,6 +5744,13 @@ fn main() -> Result<(), String> {
             "--caps" => {
                 caps_request = true;
             }
+            "--sweep" => {
+                let value = argv.next().ok_or("--sweep needs a lua_State address")?;
+                let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad address {value}"))?;
+                let script = PathBuf::from(argv.next().ok_or("--sweep needs a script path")?);
+                sweep.push((state, script));
+            }
             "--exec" => {                let value = argv.next().ok_or("--exec needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad address {value}"))?;
@@ -5817,6 +5956,16 @@ fn main() -> Result<(), String> {
         let result = unlock_caps(handle, target);
         unsafe { CloseHandle(handle) };
         return result.map(|_| ());
+    }
+
+    if !sweep.is_empty() {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        let state = sweep[0].0;
+        if let Some((other, _)) = sweep.iter().find(|(s, _)| *s != state) {
+            return Err(format!("--sweep state mismatch: 0x{other:X} vs 0x{state:X}"));
+        }
+        let scripts: Vec<PathBuf> = sweep.iter().map(|(_, p)| p.clone()).collect();
+        return lua_sizesweep(target, state, &scripts, forced_thread);
     }
 
     if let Some((state, script)) = execute {
