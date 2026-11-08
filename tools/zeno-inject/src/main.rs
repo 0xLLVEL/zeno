@@ -3350,6 +3350,90 @@ fn heap_scan(pid: u32, _module_base: u64, _module_size: u64, limit: usize) -> Re
     Ok(())
 }
 
+/// Finds the `global_State` by the one self-relative pointer it cannot avoid:
+/// the main thread lives inside it at `G + 0x90`, and `G->mainthread` at
+/// `G + 0x78` points back at it. A heap qword equal to its own address plus
+/// `0x90` is that field and nothing else, so one pass over readable memory
+/// pins the VM without a hardcoded address and without sampling threads.
+fn find_global(pid: u32, limit: usize) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!("OpenProcess({pid}) failed ({})", unsafe { GetLastError() }));
+    }
+    let mut address = 0x10000u64;
+    let mut info = [0u8; 48];
+    let chunk = 1u64 * 1024 * 1024;
+    let overlap = 0x80u64;
+    let mut hits = 0usize;
+    let mut scanned = 0u64;
+
+    while address < 0x7FFF_FFFF_0000 {
+        let got = unsafe {
+            VirtualQueryEx(handle, address as *const c_void, info.as_mut_ptr() as *mut c_void, 48)
+        };
+        if got == 0 {
+            break;
+        }
+        let base = u64::from_le_bytes(info[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(info[0x18..0x20].try_into().unwrap());
+        let state = u32::from_le_bytes(info[0x20..0x24].try_into().unwrap());
+        let protect = u32::from_le_bytes(info[0x24..0x28].try_into().unwrap());
+        if size == 0 {
+            break;
+        }
+        let next = base.saturating_add(size);
+        let readable = state == 0x1000
+            && protect & 0x100 == 0
+            && matches!(protect & 0xFF, 0x02 | 0x04 | 0x06 | 0x08 | 0x20 | 0x40 | 0x80);
+        if readable && size <= 512 * 1024 * 1024 {
+            let mut cursor = 0u64;
+            while cursor < size {
+                let want = chunk.min(size - cursor);
+                if let Some(window) = read_bytes(handle, base + cursor, want as usize) {
+                    scanned += want;
+                    let mut i = 0usize;
+                    while i + 0x80 <= window.len() {
+                        let here = base + cursor + i as u64;
+                        let q = u64::from_le_bytes(
+                            window[i + 0x50..i + 0x58].try_into().unwrap(),
+                        );
+                        i += 8;
+                        if q != here + 0x90 {
+                            continue;
+                        }
+                        if read_u64(handle, q + 0x78) != here {
+                            continue;
+                        }
+                        let main = here;
+                        let stack = read_u64(handle, main + LUA_U64_STACK);
+                        let top = read_u64(handle, main + LUA_U64_TOP);
+                        let base_ci = read_u64(handle, main + LUA_U64_BASE_CI);
+                        let ci = read_u64(handle, main + LUA_U64_CI);
+                        let size_ci = read_i32_at(handle, main + LUA_I32_SIZE_CI).unwrap_or(-1);
+                        println!(
+                            "findg       state 0x{here:X} global 0x{q:X} stack 0x{stack:X} top 0x{top:X} ci 0x{ci:X}/{base_ci:X} size_ci {size_ci}"
+                        );
+                        hits += 1;
+                        if hits >= limit {
+                            println!("findg       stopping at {limit} hits");
+                            unsafe { CloseHandle(handle) };
+                            return Ok(());
+                        }
+                    }
+                }
+                if want <= overlap {
+                    break;
+                }
+                cursor += want - overlap;
+            }
+        }
+        address = next;
+    }
+    println!("findg       {hits} hits, 0x{scanned:X} bytes scanned");
+    unsafe { CloseHandle(handle) };
+    Ok(())
+}
+
 fn vm_info(pid: u32, state: u64) -> Result<(), String> {
     let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
     if handle.is_null() || handle == -1isize as Handle {
@@ -5402,6 +5486,143 @@ fn image_test(
     Ok(())
 }
 
+/// RVA of the chunk gate that runs before `Luau::deserialize`.
+///
+/// It is handed `{chunkname, data, size, env}` and returns a small enum that
+/// the deserializer compares against `1`; anything that lands on bucket `1`
+/// is reported as `bytecode corrupted`. Chunks under `0x118` bytes short
+/// circuit to `1` without ever looking at the bytes, which is why every
+/// payload up to 279 bytes loads and every payload from 280 bytes up does
+/// not. Calling it directly with a staged buffer is the only way to see the
+/// raw verdict instead of the bucket it decays into.
+const BYTECODE_GUARD_RVA: u64 = 0x43178A0;
+
+/// Size floor the chunk gate compares `size - 0x18` against (rva 0x8195F48).
+///
+/// It ships as `0x200`, so a chunk has to be at least `0x218` bytes before the
+/// gate ever looks at the tail tag. Raising it to `INT_MAX` makes every chunk
+/// take the same early-out the 279-byte ones do, which is what lets a chunk
+/// larger than 535 bytes through at all. The cell is in module `.data`; only
+/// `.text` writes trip Hyperion.
+const GUARD_FLOOR_RVA: u64 = 0x8195F48;
+const GUARD_FLOOR_STOCK: u32 = 0x200;
+const GUARD_FLOOR_OPEN: u32 = 0x7FFF_FFFF;
+
+fn guard_floor(pid: u32, open: bool) -> Result<(), String> {
+    let module = modules_of(pid)
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(EXE))
+        .ok_or_else(|| format!("{EXE} module not found"))?;
+    let address = module.base + GUARD_FLOOR_RVA;
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!(
+            "OpenProcess({pid}) failed ({})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let before = read_i32_at(handle, address).unwrap_or(0) as u32;
+    let value = if open {
+        GUARD_FLOOR_OPEN
+    } else {
+        GUARD_FLOOR_STOCK
+    };
+    let ok = write_bytes_at(handle, address, &value.to_le_bytes());
+    unsafe { CloseHandle(handle) };
+    println!(
+        "guardfloor  0x{address:X} 0x{before:X} -> 0x{value:X} ({})",
+        if ok { "written" } else { "FAILED" }
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err("guard floor write failed".into())
+    }
+}
+
+fn bytecode_guard_probe(
+    pid: u32,
+    script: &std::path::Path,
+    prefer: Option<u32>,
+) -> Result<(), String> {
+    let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if handle.is_null() || handle == -1isize as Handle {
+        return Err(format!(
+            "OpenProcess({pid}) failed ({})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let blob = std::fs::read(script).map_err(|e| format!("{}: {e}", script.display()))?;
+    const MAGIC: [u8; 8] = [0x52, 0x7A, 0x10, 0x4A, 0x5B, 0x32, 0x09, 0xE0];
+    let blob: &[u8] = if blob.starts_with(&MAGIC) {
+        &blob[8..]
+    } else {
+        &blob[..]
+    };
+    let size = blob.len();
+    let alloc = |len: usize| unsafe {
+        VirtualAllocEx(
+            handle,
+            std::ptr::null_mut(),
+            len.max(0x40),
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    let data_slot = alloc(size + 1);
+    let name_slot = alloc(0x20);
+    let in_slot = alloc(0x20);
+    let out_slot = alloc(0x40);
+    if data_slot.is_null() || name_slot.is_null() || in_slot.is_null() || out_slot.is_null() {
+        unsafe { CloseHandle(handle) };
+        return Err("probe allocation failed".into());
+    }
+    let mut descriptor = [0u8; 0x20];
+    descriptor[0x00..0x08].copy_from_slice(&(name_slot as u64).to_le_bytes());
+    descriptor[0x08..0x10].copy_from_slice(&(data_slot as u64).to_le_bytes());
+    descriptor[0x10..0x18].copy_from_slice(&(size as u64).to_le_bytes());
+    let ok = write_bytes_at(handle, data_slot as u64, &blob)
+        && write_bytes_at(handle, name_slot as u64, b"=zeno\0")
+        && write_bytes_at(handle, in_slot as u64, &descriptor)
+        && write_bytes_at(handle, out_slot as u64, &[0u8; 0x40]);
+    if !ok {
+        unsafe { CloseHandle(handle) };
+        return Err("probe write failed".into());
+    }
+
+    println!(
+        "guard       chunk {} {size} B, in 0x{:X}, out 0x{:X}",
+        script.display(),
+        in_slot as u64,
+        out_slot as u64
+    );
+    let out_addr = out_slot as u64;
+    let watch: Vec<(&'static str, Box<dyn Fn(Handle)>)> = vec![(
+        "guard",
+        Box::new(move |handle| {
+            let verdict = read_i32_at(handle, out_addr).unwrap_or(-1);
+            let key = read_i32_at(handle, out_addr + 4).unwrap_or(0);
+            println!("guard       out.verdict {verdict}  out.key 0x{:08X}", key as u32);
+        }),
+    )];
+    let outcome = hijack_now_watch(
+        pid,
+        vec![Step {
+            label: "guard",
+            rva: BYTECODE_GUARD_RVA,
+            absolute: false,
+            prepare: Box::new(move |_| Some([0, in_slot as u64, out_slot as u64, 0])),
+        }],
+        20000,
+        10,
+        prefer,
+        watch,
+    );
+    unsafe { CloseHandle(handle) };
+    println!("guard       done: {outcome:?}");
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let mut dll: Option<PathBuf> = None;
     let mut pack: Option<PathBuf> = None;
@@ -5438,7 +5659,10 @@ fn main() -> Result<(), String> {
     let mut qword_write: Option<(u64, u64)> = None;
     let mut cap_scan_at: Option<(u64, usize)> = None;
     let mut caps_request = false;
+    let mut guard_probe: Option<PathBuf> = None;
+    let mut guard_open: Option<bool> = None;
     let mut heap_scan_limit: Option<usize> = None;
+    let mut find_global_limit: Option<usize> = None;
     let mut scan_live = false;
     let mut gcwalk: Option<u64> = None;
     let mut xcall: Option<(u64, [u64; 4], u64)> = None;
@@ -5728,6 +5952,10 @@ fn main() -> Result<(), String> {
                     .map_err(|_| format!("bad length {text}"))?;
                 cap_scan_at = Some((address, length));
             }
+            "--findg" => {
+                let text = argv.next().unwrap_or_else(|| "16".to_string());
+                find_global_limit = Some(text.parse::<usize>().map_err(|_| format!("bad limit {text}"))?);
+            }
             "--hscan" => {
                 let text = argv.next().unwrap_or_else(|| "40".to_string());
                 let limit = text.parse::<usize>().map_err(|_| format!("bad limit {text}"))?;
@@ -5744,6 +5972,12 @@ fn main() -> Result<(), String> {
             "--caps" => {
                 caps_request = true;
             }
+            "--sigtest" => {
+                let script = PathBuf::from(argv.next().ok_or("--sigtest needs a script path")?);
+                guard_probe = Some(script);
+            }
+            "--guardopen" => guard_open = Some(true),
+            "--guardclose" => guard_open = Some(false),
             "--sweep" => {
                 let value = argv.next().ok_or("--sweep needs a lua_State address")?;
                 let state = u64::from_str_radix(value.trim_start_matches("0x"), 16)
@@ -5832,6 +6066,11 @@ fn main() -> Result<(), String> {
         return closure_probe(target, closure);
     }
 
+    if let Some(limit) = find_global_limit {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return find_global(target, limit);
+    }
+
     if let Some(limit) = heap_scan_limit {
         let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         let modules = modules_of(target);
@@ -5847,7 +6086,18 @@ fn main() -> Result<(), String> {
         return cap_scan(target, address, length);
     }
 
-    if let Some((address, payload)) = qword_write {        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+    if let Some(open) = guard_open {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return guard_floor(target, open);
+    }
+
+    if let Some(script) = guard_probe {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
+        return bytecode_guard_probe(target, &script, forced_thread);
+    }
+
+    if let Some((address, payload)) = qword_write {
+        let target = pid.or_else(|| find_pid(EXE)).ok_or_else(|| format!("{EXE} is not running"))?;
         let handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, target) };
         if handle.is_null() || handle == -1isize as Handle {
             return Err(format!("OpenProcess({target}) failed ({})", unsafe { GetLastError() }));

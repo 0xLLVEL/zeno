@@ -99,10 +99,37 @@ def compile_source(src_path, out_path):
     os.remove(raw)
     if len(body) < 2 or body[0] != 14:
         raise SystemExit(f"unexpected bytecode header {body[:2].hex()}")
+    body = stamp_guard(body)
     blob = MAGIC + body
     with open(out_path, "wb") as f:
         f.write(blob)
     print(f"{out_path}: {len(blob)} bytes (bytecode {len(body)})")
+
+
+# The client runs a chunk gate before `Luau::deserialize` (rva 0x43178A0). Any
+# chunk shorter than 0x118 bytes short-circuits to the passing verdict without
+# reading a single byte, which is why every payload up to 279 bytes loads. At
+# 0x118 and above it wants `data[n-0x18 .. n-0x15] ^ data[n-0x04 .. n-0x01]`
+# to equal the 4-byte constant at rva 0x74C2ABC (`32 C4 6A 94`) for the first
+# three bytes, and uses the fourth byte as a verdict code. Exactly `1` is the
+# only code the gate accepts: 0 falls into the dump path, anything above 1
+# trips the suspicion threshold at rva 0x8195F90 (currently `1`).
+GUARD_TAG = bytes([0x32, 0xC4, 0x6A, 0x01])
+GUARD_MIN = 0x118
+
+
+def stamp_guard(body):
+    """Append the gate's tail tag so the chunk survives the pre-load scan.
+
+    The parser stops at the end of the last proto and ignores whatever follows,
+    so the tag rides in as trailing padding: the last 24 bytes are all zero
+    except the first four, which hold the tag, and the XOR of the two windows
+    the gate reads is then exactly `32 C4 6A 01`.
+    """
+    padded = body + b"\x00" * 24
+    padded = padded[:-24] + GUARD_TAG + padded[-20:]
+    return padded
+
 
 
 def read_varint(data, off):
